@@ -1,0 +1,24 @@
+# BuzzTV: local Android build.
+#
+# Use together with the universal Android config and the branch pin, in this
+# order:
+#   ./cerbero-uninstalled -c config/cross-android-universal.cbc \
+#                         -c config/buzztv-gstreamer-branch.cbc \
+#                         -c config/buzztv-android.cbc <command>
+# ('universal' must appear in one of the -c filenames, and must not appear in
+# this one: cerbero resolves the per-arch .cbc paths below relative to the
+# directory of the config file whose name contains 'universal'.)
+#
+# This build needs tens of gigabytes. To put the build tree somewhere other than
+# the cerbero default of ~/cerbero, add one more -c file setting home_dir rather
+# than editing this one, so the path stays out of the repository.
+from cerbero.config import Architecture
+
+# Only the ABIs the app ships. x86 and x86_64 exist in the upstream universal
+# tarball but nothing links them, so building them would only cost time and disk.
+universal_archs = {
+    Architecture.ARM64: 'cross-android-arm64.cbc',
+    Architecture.ARMv7: 'cross-android-armv7.cbc',
+}
+
+use_ccache = True
