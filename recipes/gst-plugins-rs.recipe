@@ -115,16 +115,41 @@ class Recipe(recipe.Recipe):
                 f'%(libdir)s/gstreamer-1.0/libgst{name}.la',
             ]
 
+    def trimmed_workspace(self):
+        return self.config.target_platform == Platform.ANDROID
+
     def requires_melding(self):
         if Platform.is_apple(self.config.target_platform):
             return False
         return self.library_type in (LibraryType.STATIC, LibraryType.BOTH)
+
+    # The Rust plugins the Android app links. cargo_packages is the single
+    # source of truth for what is compiled and for what is packaged -- the
+    # plugin_files loop below only enables a plugin whose cargo package is in
+    # this list -- so trimming it here trims the whole build. That matters more
+    # than the plugin list suggests: every workspace member's object code also
+    # lands in the melded libgstrsworkspace.a, 231 MB of the arm64 package when
+    # the full workspace is built, and building it is the longest step of an
+    # Android build by a wide margin.
+    ANDROID_CARGO_PACKAGES = ['closedcaption']
+
+    # Dependency names behind the `gst<component>/v1_22` features requested
+    # below. A feature of the form `dep/feature` is only valid when `dep` is a
+    # dependency of a package being built, so a trimmed workspace has to request
+    # a matching subset -- cargo errors out on the rest rather than ignoring it.
+    GST_FEATURE_DEPS = ('gst', 'gst-app', 'gst-audio', 'gst-base', 'gst-check',
+                        'gst-net', 'gst-pbutils', 'gst-rtp', 'gst-sdp',
+                        'gst-utils', 'gst-video', 'gst-webrtc')
 
     def prepare(self):
         if Platform.is_app_platform(self.config.target_platform):
             self.library_type = LibraryType.STATIC
         else:
             self.library_type = LibraryType.BOTH
+
+        if self.trimmed_workspace():
+            self.cargo_packages = [p for p in self.cargo_packages
+                                   if p in self.ANDROID_CARGO_PACKAGES]
 
         plugin_files = {
             'analytics': [
@@ -284,7 +309,75 @@ class Recipe(recipe.Recipe):
             self.set_env('AWS_LC_SYS_EXTERNAL_BINDGEN', '1')
             self.set_env('BINDGEN_EXTRA_CLANG_ARGS', f'--sysroot={self.config.sysroot}')
 
+    def _manifest_deps(self, manifest):
+        """Dependency names declared by one Cargo.toml, in any dependency table."""
+        deps = set()
+        in_deps = False
+        for line in manifest.read_text(encoding='utf-8').splitlines():
+            line = line.strip()
+            if line.startswith('['):
+                in_deps = line.rstrip(']').endswith('dependencies')
+                continue
+            if not in_deps or not line or line.startswith('#'):
+                continue
+            key = line.split('=', 1)[0].strip().strip('"\'')
+            # `gst-video.workspace = true` names the dependency in the key too
+            deps.add(key.split('.', 1)[0])
+        return deps
+
+    def _workspace_manifests(self):
+        """Map every workspace member's package name to its Cargo.toml."""
+        manifests = {}
+        for manifest in Path(self.config_src_dir).rglob('Cargo.toml'):
+            # cargo-vendor holds thousands of manifests for crates.io deps, and
+            # none of them is a workspace member
+            if 'cargo-vendor' in manifest.parts or 'target' in manifest.parts:
+                continue
+            in_package = False
+            for line in manifest.read_text(encoding='utf-8').splitlines():
+                line = line.strip()
+                if line.startswith('['):
+                    in_package = line == '[package]'
+                    continue
+                if in_package and line.startswith('name'):
+                    manifests[line.split('=', 1)[1].strip().strip('"\'')] = manifest
+                    break
+        return manifests
+
+    def prune_unavailable_features(self):
+        """
+        Drop the `gst<component>/v1_22` features whose dependency no member of
+        the trimmed workspace declares.
+
+        These features exist to raise the minimum GStreamer API version the
+        plugins are built against. With the full workspace every component is
+        some member's dependency; with a trimmed one most are not, and cargo
+        fails the build with "does not contain these features" rather than
+        skipping them. Deriving the set from the manifests keeps this correct
+        when ANDROID_CARGO_PACKAGES changes.
+        """
+        manifests = self._workspace_manifests()
+        available = set()
+        for package in self.cargo_packages:
+            manifest = manifests.get(package)
+            if manifest is None:
+                raise FatalError(f'{self.name}: no workspace member named {package}')
+            available |= self._manifest_deps(manifest)
+
+        kept = []
+        for feature in self.cargo_features:
+            dep = feature.split('/', 1)[0]
+            if dep in self.GST_FEATURE_DEPS and dep not in available:
+                continue
+            kept.append(feature)
+        dropped = sorted(set(self.cargo_features) - set(kept))
+        if dropped:
+            m.message(f'{self.name}: no workspace member depends on {", ".join(dropped)}, dropping')
+        self.cargo_features = kept
+
     async def configure(self):
+        if self.trimmed_workspace():
+            self.prune_unavailable_features()
         # Check that the Cargo.toml version matches the recipe version
         toml_version = self.get_cargo_toml_version()
         if toml_version != self.version and running_on_cerbero_ci():
@@ -415,6 +508,21 @@ class Recipe(recipe.Recipe):
             await shell.async_call(
                 [dragonfire, '-o', self.workspace_lib, '-f', fmt, *files], cmd_dir=self.config.prefix, logfile=self.logfile, env=self.env
             )
+
+            if not self.workspace_lib.exists():
+                # dragonfire moves the object files that appear in more than one
+                # plugin archive into the workspace library. With a single plugin
+                # enabled -- see ANDROID_CARGO_PACKAGES -- nothing is shared, so it
+                # reports "already deduplicated" and writes nothing. The
+                # Requires.private injected into every plugin .pc below, the .la
+                # and the file lists all name the library regardless, so create it
+                # empty rather than making all of that conditional: linking an
+                # empty archive is a no-op, and a missing one is a link error in
+                # whatever consumes the package.
+                await shell.async_call(
+                    [self.get_env('AR', 'ar'), 'rc', str(self.workspace_lib)],
+                    cmd_dir=self.config.prefix, logfile=self.logfile, env=self.env
+                )
 
             # These end up cached, remove them
             for f in files:
