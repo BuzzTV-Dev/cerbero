@@ -141,7 +141,22 @@ jobs:
           ./tools/buzztv-prepare-gstreamer-branch.sh "${{ github.workspace }}/cerbero-sources/gstreamer-1.0"
 
       - name: Fetch sources
-        run: $CERBERO $CERBERO_ARGS fetch-package --jobs=8 --deps "$CERBERO_PACKAGE"
+        # Retried, because this step is one long sequence of downloads from
+        # third-party hosts and any one of them can rate-limit a CI runner --
+        # freedesktop.org answers 418 when it does, and cerbero's mirrors do not
+        # carry every version. ci/run_retry.sh is no use here: it only retries
+        # errors on its allowlist, and a download failure is not one of them.
+        run: |
+          set -eu
+          for attempt in 1 2 3; do
+            if $CERBERO $CERBERO_ARGS fetch-package --jobs=8 --deps "$CERBERO_PACKAGE"; then
+              exit 0
+            fi
+            echo "fetch attempt ${attempt} failed"
+            sleep $((attempt * 30))
+          done
+          echo "fetch failed three times; the last log above says which URL" >&2
+          exit 1
 
       - name: Package
         # --offline proves the fetch step got everything; a recipe that reaches
