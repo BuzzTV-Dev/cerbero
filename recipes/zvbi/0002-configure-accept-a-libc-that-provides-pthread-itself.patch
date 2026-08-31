@@ -1,0 +1,54 @@
+From 8371757f789fa03d068e680b4e175448de26168c Mon Sep 17 00:00:00 2001
+From: Maksym Vasylchuk <max@buzztv.com>
+Date: Mon, 31 Aug 2026 19:19:00 +0300
+Subject: [PATCH 2/4] configure: accept a libc that provides pthread itself
+
+The pthread probe insists on finding pthread_create in a library: it tries
+-lpthread, then -lpthreadGC2, then a link test, then -pthread, and errors
+out otherwise. Android has no libpthread -- bionic implements the pthread
+API in libc, as glibc has since 2.34 -- so all four fail and configure
+stops with "Unable to link pthread functions".
+
+The existing link test cannot cover this case because it calls
+pthread_create() with no arguments and no declaration in scope, which a
+compiler defaulting to C23 (NDK r29's clang) rejects outright.
+
+Probe libc first with a call that compiles, and only fall back to the
+library search when that fails.
+---
+ configure.ac | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/configure.ac b/configure.ac
+index 7ca51b3..38fc288 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -237,6 +237,17 @@ dnl
+ dnl When upgrading to autoconf 2.71, AC_TRY_LINK deprecated and replaced
+ dnl with AC_LINK_IFELSE.
+ dnl
++dnl Android's bionic, like glibc since 2.34, implements the pthread functions
++dnl in libc and ships no libpthread at all, so check libc before looking for a
++dnl library to link. The AC_LINK_IFELSE fallback below cannot serve that purpose:
++dnl its test calls pthread_create() with no arguments, which a compiler defaulting
++dnl to C23 rejects outright rather than warning about.
++AC_LINK_IFELSE([AC_LANG_PROGRAM([[#include <pthread.h>]],
++			       [[pthread_create (0, 0, 0, 0);]])],
++  [zvbi_pthread_in_libc=yes],
++  [zvbi_pthread_in_libc=no])
++
++AS_IF([test "x$zvbi_pthread_in_libc" = xno],[
+ AC_CHECK_LIB(pthread, pthread_create,,[
+   AC_CHECK_LIB(pthreadGC2, pthread_create,,[
+     AC_LINK_IFELSE([AC_LANG_PROGRAM([[]], [[pthread_create();]])],[],[
+@@ -248,6 +259,7 @@ AC_CHECK_LIB(pthread, pthread_create,,[
+     ])
+   ])
+ ])
++])
+ 
+ dnl
+ dnl See if struct tm has tm_gmtoff, a BSD/GNU extension.
+-- 
+2.55.0
+
