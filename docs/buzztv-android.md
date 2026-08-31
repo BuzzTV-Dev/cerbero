@@ -256,6 +256,23 @@ lists `universal_archs`, which a per-ABI build does not want. The workflow write
 its own localconf and shares only `config/buzztv-gstreamer-branch.cbc`, which is
 why that pin lives in its own file.
 
+### Debug info on armv7
+
+`config/cross-android-armv7.cbc` carries upstream's
+`variants.override('nodebug')`, and whether it takes effect depends on how the
+build is invoked: a universal build never applies it -- which is why the
+official prebuilts, and any local universal build here, ship armv7 *with* debug
+info -- while a per-ABI build does. Since CI builds one ABI per job, the first
+release came out with armv7 stripped: `libavcodec.a` was 13 MiB against 72 MiB
+on the other side of the same tarball.
+
+The workflow therefore passes `-v debug` explicitly, for parity with the
+prebuilt it replaces. The cost is roughly 70 MiB of download; the alternative is
+no symbolication of GStreamer frames in armv7 crash reports, on the 32-bit
+devices where they are most needed. The variant only adds `-g` --
+`-Doptimization=s` and assertions are the same either way -- so this changes what
+can be debugged, not what is executed.
+
 Note that cerbero's Debian bootstrapper runs `apt-get install` without an
 `apt-get update` first -- fine against the prepared images the GitLab CI uses,
 but a runner's package index can be older than the mirrors it points at, and then
