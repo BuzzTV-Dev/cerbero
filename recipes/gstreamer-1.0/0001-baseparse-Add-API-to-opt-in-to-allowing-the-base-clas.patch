@@ -1,0 +1,542 @@
+From cbab56c141b7eec178ceb6e576038d6d480b1fce Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Sebastian=20Dr=C3=B6ge?= <sebastian@centricular.com>
+Date: Tue, 7 Jul 2026 19:26:41 +0300
+Subject: [PATCH] baseparse: Add API to opt-in to allowing the base class to
+ output duplicated PTS
+
+Similar fix to
+
+  - https://gitlab.freedesktop.org/gstreamer/gstreamer/-/merge_requests/287
+  - https://gitlab.freedesktop.org/gstreamer/gstreamer/-/merge_requests/649
+  - https://gitlab.freedesktop.org/gstreamer/gstreamer/-/merge_requests/3462
+  - https://gitlab.freedesktop.org/gstreamer/gstreamer/-/merge_requests/7229
+
+The main difference is that this now adds new API for parser subclasses to
+explicitly opt-in to this behaviour. Enabling it unconditionally (or mixing it
+with the PTS interpolation API) would break audio parsers. On duplicated PTS,
+downstream of the parser would likely trigger a resync instead of interpolating
+PTS based on the number of actual samples.
+
+Also update all video parsers to actually use the new API and update the
+h264parse, h265parse and h266parse tests for this situation, partially taken
+from the last MR by Max Romanov. These tests were working around / asserting on
+the previous, broken behaviour.
+
+Fixes https://gitlab.freedesktop.org/gstreamer/gstreamer/-/work_items/1515
+
+Part-of: <https://gitlab.freedesktop.org/gstreamer/gstreamer/-/merge_requests/12032>
+---
+ girs/GstBase-1.0.gir                          | 32 +++++++++++++
+ .../gst/ivfparse/gstivfparse.c                |  1 +
+ .../gst/jpegformat/gstjpegparse.c             |  1 +
+ .../gst/videoparsers/gstav1parse.c            |  1 +
+ .../gst/videoparsers/gstdiracparse.c          |  1 +
+ .../gst/videoparsers/gsth263parse.c           |  1 +
+ .../gst/videoparsers/gsth264parse.c           |  1 +
+ .../gst/videoparsers/gsth265parse.c           |  1 +
+ .../gst/videoparsers/gsth266parse.c           |  1 +
+ .../gst/videoparsers/gstjpeg2000parse.c       |  2 +
+ .../gst/videoparsers/gstmpeg4videoparse.c     |  1 +
+ .../gst/videoparsers/gstmpegvideoparse.c      |  1 +
+ .../gst/videoparsers/gstpngparse.c            |  1 +
+ .../gst/videoparsers/gstvc1parse.c            |  1 +
+ .../gst/videoparsers/gstvp9parse.c            |  1 +
+ .../tests/check/elements/h264parse.c          | 17 ++++---
+ .../tests/check/elements/h265parse.c          | 25 ++++------
+ .../tests/check/elements/h266parse.c          | 13 ++----
+ .../gst/rawparse/gstrawvideoparse.c           |  2 +
+ .../gst-plugins-good/gst/y4m/gsty4mdec.c      |  1 +
+ .../gstreamer/libs/gst/base/gstbaseparse.c    | 46 +++++++++++++++++++
+ .../gstreamer/libs/gst/base/gstbaseparse.h    |  3 ++
+ 22 files changed, 121 insertions(+), 33 deletions(-)
+
+diff --git a/girs/GstBase-1.0.gir b/girs/GstBase-1.0.gir
+index dbdfbe6581..b8ba6c51f2 100644
+--- a/girs/GstBase-1.0.gir
++++ b/girs/GstBase-1.0.gir
+@@ -3636,6 +3636,38 @@ This must be called with sinkpad STREAM_LOCK held.</doc>
+           </parameter>
+         </parameters>
+       </method>
++      <method name="set_allow_duplicated_pts" c:identifier="gst_base_parse_set_allow_duplicated_pts" version="1.30">
++        <doc xml:space="preserve" filename="../subprojects/gstreamer/libs/gst/base/gstbaseparse.c">By default, the base class will not allow two frames in a row to have the
++same PTS but instead will set the second frame's PTS to GST_CLOCK_TIME_NONE.
++Setting @allow_duplicated_pts would allow outputting the same PTS multiple
++times.
++
++For audio parsers this is generally not a good idea to allow as it can lead to
++unnecessary resyncs if upstream provides coarse grained timestamps and
++decoders and other elements generally interpolate missing timestamps based on
++the number of samples so missing timestamps would be fixed up later.
++
++For video parsers this generally should be allowed as various elements expect
++valid timestamps on all video frames and will error out or misbehave
++otherwise.
++
++This value is not reset during PAUSED-&gt;READY state changes. Subclasses
++can call this function from their instance init function.</doc>
++        <source-position filename="../subprojects/gstreamer/libs/gst/base/gstbaseparse.h"/>
++        <return-value transfer-ownership="none">
++          <type name="none" c:type="void"/>
++        </return-value>
++        <parameters>
++          <instance-parameter name="parse" transfer-ownership="none">
++            <doc xml:space="preserve" filename="../subprojects/gstreamer/libs/gst/base/gstbaseparse.c">a #GstBaseParse</doc>
++            <type name="BaseParse" c:type="GstBaseParse*"/>
++          </instance-parameter>
++          <parameter name="allow_duplicated_pts" transfer-ownership="none">
++            <doc xml:space="preserve" filename="../subprojects/gstreamer/libs/gst/base/gstbaseparse.c">%TRUE if parser should allow duplicated PTS on the output</doc>
++            <type name="gboolean" c:type="gboolean"/>
++          </parameter>
++        </parameters>
++      </method>
+       <method name="set_average_bitrate" c:identifier="gst_base_parse_set_average_bitrate">
+         <doc xml:space="preserve" filename="../subprojects/gstreamer/libs/gst/base/gstbaseparse.c">Optionally sets the average bitrate detected in media (if non-zero),
+ e.g. based on metadata, as it will be posted to the application.
+diff --git a/subprojects/gst-plugins-bad/gst/ivfparse/gstivfparse.c b/subprojects/gst-plugins-bad/gst/ivfparse/gstivfparse.c
+index bf27c2436e..31ed4f4d61 100644
+--- a/subprojects/gst-plugins-bad/gst/ivfparse/gstivfparse.c
++++ b/subprojects/gst-plugins-bad/gst/ivfparse/gstivfparse.c
+@@ -131,6 +131,7 @@ gst_ivf_parse_reset (GstIvfParse * ivf)
+ static void
+ gst_ivf_parse_init (GstIvfParse * ivf)
+ {
++  gst_base_parse_set_allow_duplicated_pts (GST_BASE_PARSE (ivf), TRUE);
+   gst_ivf_parse_reset (ivf);
+ }
+ 
+diff --git a/subprojects/gst-plugins-bad/gst/jpegformat/gstjpegparse.c b/subprojects/gst-plugins-bad/gst/jpegformat/gstjpegparse.c
+index c7a711c0d9..5dc0f7bee7 100644
+--- a/subprojects/gst-plugins-bad/gst/jpegformat/gstjpegparse.c
++++ b/subprojects/gst-plugins-bad/gst/jpegformat/gstjpegparse.c
+@@ -192,6 +192,7 @@ gst_jpeg_parse_class_init (GstJpegParseClass * klass)
+ static void
+ gst_jpeg_parse_init (GstJpegParse * parse)
+ {
++  gst_base_parse_set_allow_duplicated_pts (GST_BASE_PARSE (parse), TRUE);
+   parse->sof = -1;
+ }
+ 
+diff --git a/subprojects/gst-plugins-bad/gst/videoparsers/gstav1parse.c b/subprojects/gst-plugins-bad/gst/videoparsers/gstav1parse.c
+index 7a58e6ab0a..b1b631f223 100644
+--- a/subprojects/gst-plugins-bad/gst/videoparsers/gstav1parse.c
++++ b/subprojects/gst-plugins-bad/gst/videoparsers/gstav1parse.c
+@@ -373,6 +373,7 @@ gst_av1_parse_init (GstAV1Parse * self)
+ {
+   gst_base_parse_set_pts_interpolation (GST_BASE_PARSE (self), FALSE);
+   gst_base_parse_set_infer_ts (GST_BASE_PARSE (self), FALSE);
++  gst_base_parse_set_allow_duplicated_pts (GST_BASE_PARSE (self), TRUE);
+ 
+   GST_PAD_SET_ACCEPT_INTERSECT (GST_BASE_PARSE_SINK_PAD (self));
+   GST_PAD_SET_ACCEPT_TEMPLATE (GST_BASE_PARSE_SINK_PAD (self));
+diff --git a/subprojects/gst-plugins-bad/gst/videoparsers/gstdiracparse.c b/subprojects/gst-plugins-bad/gst/videoparsers/gstdiracparse.c
+index e53fcae438..8d8b6ee483 100644
+--- a/subprojects/gst-plugins-bad/gst/videoparsers/gstdiracparse.c
++++ b/subprojects/gst-plugins-bad/gst/videoparsers/gstdiracparse.c
+@@ -141,6 +141,7 @@ gst_dirac_parse_init (GstDiracParse * diracparse)
+   gst_base_parse_set_min_frame_size (GST_BASE_PARSE (diracparse), 13);
+   gst_base_parse_set_pts_interpolation (GST_BASE_PARSE (diracparse), FALSE);
+   gst_base_parse_set_infer_ts (GST_BASE_PARSE (diracparse), FALSE);
++  gst_base_parse_set_allow_duplicated_pts (GST_BASE_PARSE (diracparse), TRUE);
+   GST_PAD_SET_ACCEPT_INTERSECT (GST_BASE_PARSE_SINK_PAD (diracparse));
+   GST_PAD_SET_ACCEPT_TEMPLATE (GST_BASE_PARSE_SINK_PAD (diracparse));
+ }
+diff --git a/subprojects/gst-plugins-bad/gst/videoparsers/gsth263parse.c b/subprojects/gst-plugins-bad/gst/videoparsers/gsth263parse.c
+index b3d914408a..b00bd6e8ec 100644
+--- a/subprojects/gst-plugins-bad/gst/videoparsers/gsth263parse.c
++++ b/subprojects/gst-plugins-bad/gst/videoparsers/gsth263parse.c
+@@ -100,6 +100,7 @@ gst_h263_parse_init (GstH263Parse * h263parse)
+ {
+   gst_base_parse_set_pts_interpolation (GST_BASE_PARSE (h263parse), FALSE);
+   gst_base_parse_set_infer_ts (GST_BASE_PARSE (h263parse), FALSE);
++  gst_base_parse_set_allow_duplicated_pts (GST_BASE_PARSE (h263parse), TRUE);
+   GST_PAD_SET_ACCEPT_INTERSECT (GST_BASE_PARSE_SINK_PAD (h263parse));
+   GST_PAD_SET_ACCEPT_TEMPLATE (GST_BASE_PARSE_SINK_PAD (h263parse));
+ }
+diff --git a/subprojects/gst-plugins-bad/gst/videoparsers/gsth264parse.c b/subprojects/gst-plugins-bad/gst/videoparsers/gsth264parse.c
+index e1ae4e6241..367376e311 100644
+--- a/subprojects/gst-plugins-bad/gst/videoparsers/gsth264parse.c
++++ b/subprojects/gst-plugins-bad/gst/videoparsers/gsth264parse.c
+@@ -199,6 +199,7 @@ gst_h264_parse_init (GstH264Parse * h264parse)
+   h264parse->frame_out = gst_adapter_new ();
+   gst_base_parse_set_pts_interpolation (GST_BASE_PARSE (h264parse), FALSE);
+   gst_base_parse_set_infer_ts (GST_BASE_PARSE (h264parse), FALSE);
++  gst_base_parse_set_allow_duplicated_pts (GST_BASE_PARSE (h264parse), TRUE);
+   GST_PAD_SET_ACCEPT_INTERSECT (GST_BASE_PARSE_SINK_PAD (h264parse));
+   GST_PAD_SET_ACCEPT_TEMPLATE (GST_BASE_PARSE_SINK_PAD (h264parse));
+ 
+diff --git a/subprojects/gst-plugins-bad/gst/videoparsers/gsth265parse.c b/subprojects/gst-plugins-bad/gst/videoparsers/gsth265parse.c
+index e0ed336593..c33c663baf 100644
+--- a/subprojects/gst-plugins-bad/gst/videoparsers/gsth265parse.c
++++ b/subprojects/gst-plugins-bad/gst/videoparsers/gsth265parse.c
+@@ -172,6 +172,7 @@ gst_h265_parse_init (GstH265Parse * h265parse)
+   h265parse->frame_out = gst_adapter_new ();
+   gst_base_parse_set_pts_interpolation (GST_BASE_PARSE (h265parse), FALSE);
+   gst_base_parse_set_infer_ts (GST_BASE_PARSE (h265parse), FALSE);
++  gst_base_parse_set_allow_duplicated_pts (GST_BASE_PARSE (h265parse), TRUE);
+   GST_PAD_SET_ACCEPT_INTERSECT (GST_BASE_PARSE_SINK_PAD (h265parse));
+   GST_PAD_SET_ACCEPT_TEMPLATE (GST_BASE_PARSE_SINK_PAD (h265parse));
+ 
+diff --git a/subprojects/gst-plugins-bad/gst/videoparsers/gsth266parse.c b/subprojects/gst-plugins-bad/gst/videoparsers/gsth266parse.c
+index 8a662a6385..2e3b1c6678 100644
+--- a/subprojects/gst-plugins-bad/gst/videoparsers/gsth266parse.c
++++ b/subprojects/gst-plugins-bad/gst/videoparsers/gsth266parse.c
+@@ -226,6 +226,7 @@ gst_h266_parse_init (GstH266Parse * h266parse)
+   h266parse->frame_out = gst_adapter_new ();
+   gst_base_parse_set_pts_interpolation (GST_BASE_PARSE (h266parse), FALSE);
+   gst_base_parse_set_infer_ts (GST_BASE_PARSE (h266parse), FALSE);
++  gst_base_parse_set_allow_duplicated_pts (GST_BASE_PARSE (h266parse), TRUE);
+   GST_PAD_SET_ACCEPT_INTERSECT (GST_BASE_PARSE_SINK_PAD (h266parse));
+   GST_PAD_SET_ACCEPT_TEMPLATE (GST_BASE_PARSE_SINK_PAD (h266parse));
+ }
+diff --git a/subprojects/gst-plugins-bad/gst/videoparsers/gstjpeg2000parse.c b/subprojects/gst-plugins-bad/gst/videoparsers/gstjpeg2000parse.c
+index d750b1fa64..da301221f8 100644
+--- a/subprojects/gst-plugins-bad/gst/videoparsers/gstjpeg2000parse.c
++++ b/subprojects/gst-plugins-bad/gst/videoparsers/gstjpeg2000parse.c
+@@ -345,6 +345,8 @@ gst_jpeg2000_parse_start (GstBaseParse * parse)
+ static void
+ gst_jpeg2000_parse_init (GstJPEG2000Parse * jpeg2000parse)
+ {
++  gst_base_parse_set_allow_duplicated_pts (GST_BASE_PARSE (jpeg2000parse),
++      TRUE);
+   GST_PAD_SET_ACCEPT_INTERSECT (GST_BASE_PARSE_SINK_PAD (jpeg2000parse));
+   GST_PAD_SET_ACCEPT_TEMPLATE (GST_BASE_PARSE_SINK_PAD (jpeg2000parse));
+ }
+diff --git a/subprojects/gst-plugins-bad/gst/videoparsers/gstmpeg4videoparse.c b/subprojects/gst-plugins-bad/gst/videoparsers/gstmpeg4videoparse.c
+index 065140f389..1c5450ca37 100644
+--- a/subprojects/gst-plugins-bad/gst/videoparsers/gstmpeg4videoparse.c
++++ b/subprojects/gst-plugins-bad/gst/videoparsers/gstmpeg4videoparse.c
+@@ -190,6 +190,7 @@ gst_mpeg4vparse_init (GstMpeg4VParse * parse)
+ 
+   gst_base_parse_set_pts_interpolation (GST_BASE_PARSE (parse), FALSE);
+   gst_base_parse_set_infer_ts (GST_BASE_PARSE (parse), FALSE);
++  gst_base_parse_set_allow_duplicated_pts (GST_BASE_PARSE (parse), TRUE);
+   GST_PAD_SET_ACCEPT_INTERSECT (GST_BASE_PARSE_SINK_PAD (parse));
+   GST_PAD_SET_ACCEPT_TEMPLATE (GST_BASE_PARSE_SINK_PAD (parse));
+ }
+diff --git a/subprojects/gst-plugins-bad/gst/videoparsers/gstmpegvideoparse.c b/subprojects/gst-plugins-bad/gst/videoparsers/gstmpegvideoparse.c
+index 8cd1b2b492..8709bfbf17 100644
+--- a/subprojects/gst-plugins-bad/gst/videoparsers/gstmpegvideoparse.c
++++ b/subprojects/gst-plugins-bad/gst/videoparsers/gstmpegvideoparse.c
+@@ -179,6 +179,7 @@ gst_mpegv_parse_init (GstMpegvParse * parse)
+ 
+   gst_base_parse_set_pts_interpolation (GST_BASE_PARSE (parse), FALSE);
+   gst_base_parse_set_infer_ts (GST_BASE_PARSE (parse), FALSE);
++  gst_base_parse_set_allow_duplicated_pts (GST_BASE_PARSE (parse), TRUE);
+   GST_PAD_SET_ACCEPT_INTERSECT (GST_BASE_PARSE_SINK_PAD (parse));
+   GST_PAD_SET_ACCEPT_TEMPLATE (GST_BASE_PARSE_SINK_PAD (parse));
+ }
+diff --git a/subprojects/gst-plugins-bad/gst/videoparsers/gstpngparse.c b/subprojects/gst-plugins-bad/gst/videoparsers/gstpngparse.c
+index 9aab71f3d6..bdb8621cfd 100644
+--- a/subprojects/gst-plugins-bad/gst/videoparsers/gstpngparse.c
++++ b/subprojects/gst-plugins-bad/gst/videoparsers/gstpngparse.c
+@@ -83,6 +83,7 @@ gst_png_parse_class_init (GstPngParseClass * klass)
+ static void
+ gst_png_parse_init (GstPngParse * pngparse)
+ {
++  gst_base_parse_set_allow_duplicated_pts (GST_BASE_PARSE (pngparse), TRUE);
+   GST_PAD_SET_ACCEPT_INTERSECT (GST_BASE_PARSE_SINK_PAD (pngparse));
+   GST_PAD_SET_ACCEPT_TEMPLATE (GST_BASE_PARSE_SINK_PAD (pngparse));
+ }
+diff --git a/subprojects/gst-plugins-bad/gst/videoparsers/gstvc1parse.c b/subprojects/gst-plugins-bad/gst/videoparsers/gstvc1parse.c
+index 3ceebfce5b..6f0ed82299 100644
+--- a/subprojects/gst-plugins-bad/gst/videoparsers/gstvc1parse.c
++++ b/subprojects/gst-plugins-bad/gst/videoparsers/gstvc1parse.c
+@@ -254,6 +254,7 @@ gst_vc1_parse_init (GstVC1Parse * vc1parse)
+   /* We have reordered frames - don't interpolate PTS */
+   gst_base_parse_set_pts_interpolation (GST_BASE_PARSE (vc1parse), FALSE);
+   gst_base_parse_set_infer_ts (GST_BASE_PARSE (vc1parse), FALSE);
++  gst_base_parse_set_allow_duplicated_pts (GST_BASE_PARSE (vc1parse), TRUE);
+ }
+ 
+ static void
+diff --git a/subprojects/gst-plugins-bad/gst/videoparsers/gstvp9parse.c b/subprojects/gst-plugins-bad/gst/videoparsers/gstvp9parse.c
+index be29d69cf3..13a0972664 100644
+--- a/subprojects/gst-plugins-bad/gst/videoparsers/gstvp9parse.c
++++ b/subprojects/gst-plugins-bad/gst/videoparsers/gstvp9parse.c
+@@ -129,6 +129,7 @@ gst_vp9_parse_init (GstVp9Parse * self)
+ {
+   gst_base_parse_set_pts_interpolation (GST_BASE_PARSE (self), FALSE);
+   gst_base_parse_set_infer_ts (GST_BASE_PARSE (self), FALSE);
++  gst_base_parse_set_allow_duplicated_pts (GST_BASE_PARSE (self), TRUE);
+ 
+   GST_PAD_SET_ACCEPT_INTERSECT (GST_BASE_PARSE_SINK_PAD (self));
+   GST_PAD_SET_ACCEPT_TEMPLATE (GST_BASE_PARSE_SINK_PAD (self));
+diff --git a/subprojects/gst-plugins-bad/tests/check/elements/h264parse.c b/subprojects/gst-plugins-bad/tests/check/elements/h264parse.c
+index 5626704dc6..9330096791 100644
+--- a/subprojects/gst-plugins-bad/tests/check/elements/h264parse.c
++++ b/subprojects/gst-plugins-bad/tests/check/elements/h264parse.c
+@@ -1060,7 +1060,7 @@ GST_START_TEST (test_parse_sliced_nal_nal)
+   fail_unless_equals_clocktime (gst_harness_query_latency (h), 0);
+ 
+   /* test some flow with 2 slices.
+-   * 1st slice gets the input PTS, second gets NONE */
++   * Both slices get the input PTS */
+   buf = wrap_buffer (h264_idr_slice_1, sizeof (h264_idr_slice_1), 100, 0);
+   fail_unless_equals_int (gst_harness_push (h, buf), GST_FLOW_OK);
+   fail_unless_equals_int (gst_harness_buffers_in_queue (h), 1);
+@@ -1069,7 +1069,7 @@ GST_START_TEST (test_parse_sliced_nal_nal)
+   buf = wrap_buffer (h264_idr_slice_2, sizeof (h264_idr_slice_2), 100, 0);
+   fail_unless_equals_int (gst_harness_push (h, buf), GST_FLOW_OK);
+   fail_unless_equals_int (gst_harness_buffers_in_queue (h), 1);
+-  pull_and_check (h, h264_idr_slice_2, -1, 0);
++  pull_and_check (h, h264_idr_slice_2, 100, 0);
+ 
+   buf = wrap_buffer (h264_idr_slice_1, sizeof (h264_idr_slice_1), 200, 0);
+   fail_unless_equals_int (gst_harness_push (h, buf), GST_FLOW_OK);
+@@ -1080,7 +1080,7 @@ GST_START_TEST (test_parse_sliced_nal_nal)
+   buf = wrap_buffer (h264_idr_slice_2, sizeof (h264_idr_slice_2), 200, 0);
+   fail_unless_equals_int (gst_harness_push (h, buf), GST_FLOW_OK);
+   fail_unless_equals_int (gst_harness_buffers_in_queue (h), 1);
+-  pull_and_check (h, h264_idr_slice_2, -1, 0);
++  pull_and_check (h, h264_idr_slice_2, 200, 0);
+ 
+   buf = wrap_buffer (h264_idr_slice_1, sizeof (h264_idr_slice_1), 250, 0);
+   fail_unless_equals_int (gst_harness_push (h, buf), GST_FLOW_OK);
+@@ -1130,10 +1130,9 @@ GST_START_TEST (test_parse_sliced_au_nal)
+   /* reported latency must be zero */
+   fail_unless_equals_clocktime (gst_harness_query_latency (h), 0);
+ 
+-  /* 1st slice here doens't have a PTS
+-   * because it was present in the first header NAL */
+-  pull_and_check (h, h264_idr_slice_1, -1, 0);
+-  pull_and_check (h, h264_idr_slice_2, -1, 0);
++  /* Both slices from the first AU get the PTS from the input buffer */
++  pull_and_check (h, h264_idr_slice_1, 100, 0);
++  pull_and_check (h, h264_idr_slice_2, 100, 0);
+ 
+   /* new AU. we expect AUD to be inserted and 1st slice to have the same PTS */
+   buf = composite_buffer (200, 0, 2,
+@@ -1143,7 +1142,7 @@ GST_START_TEST (test_parse_sliced_au_nal)
+   fail_unless_equals_int (gst_harness_buffers_in_queue (h), 3);
+   pull_and_check (h, h264_aud, 200, 0);
+   pull_and_check (h, h264_idr_slice_1, 200, 0);
+-  pull_and_check (h, h264_idr_slice_2, -1, 0);
++  pull_and_check (h, h264_idr_slice_2, 200, 0);
+ 
+   /* DISCONT must be propagated */
+   buf = composite_buffer (400, GST_BUFFER_FLAG_DISCONT, 2,
+@@ -1153,7 +1152,7 @@ GST_START_TEST (test_parse_sliced_au_nal)
+   fail_unless_equals_int (gst_harness_buffers_in_queue (h), 3);
+   pull_and_check (h, h264_aud, 400, 0);
+   pull_and_check (h, h264_idr_slice_1, 400, GST_BUFFER_FLAG_DISCONT);
+-  pull_and_check (h, h264_idr_slice_2, -1, 0);
++  pull_and_check (h, h264_idr_slice_2, 400, 0);
+ 
+   gst_harness_teardown (h);
+ }
+diff --git a/subprojects/gst-plugins-bad/tests/check/elements/h265parse.c b/subprojects/gst-plugins-bad/tests/check/elements/h265parse.c
+index 1624c804b5..a7fe667680 100644
+--- a/subprojects/gst-plugins-bad/tests/check/elements/h265parse.c
++++ b/subprojects/gst-plugins-bad/tests/check/elements/h265parse.c
+@@ -811,13 +811,8 @@ test_headers_outalign_nal (GstHarness * h)
+   pull_and_check (h, h265_128x128_sps, 10, 0);
+   pull_and_check (h, h265_128x128_pps, 10, 0);
+ 
+-  /* FIXME The timestamp should be 10 really, but base parse refuse to repeat
+-   * the same TS for two consecutive calls to _finish_frame(), see [0] for
+-   * more details. It's not a huge issue, the decoder can fix it for now.
+-   *
+-   * [0] https://gitlab.freedesktop.org/gstreamer/gstreamer/-/merge_requests/287
+-   */
+-  pull_and_check (h, h265_128x128_slice_idr_n_lp, -1, 0);
++  /* The slice retains the PTS from the input buffer (same as headers) */
++  pull_and_check (h, h265_128x128_slice_idr_n_lp, 10, 0);
+ }
+ 
+ static void
+@@ -1026,9 +1021,9 @@ GST_START_TEST (test_sliced_nal_nal)
+   while (gst_harness_buffers_in_queue (h) > 2)
+     pull_and_drop (h);
+ 
+-  /* but expect 2 slices */
+-  pull_and_check (h, h265_128x128_slice_1_idr_n_lp, -1, 0);
+-  pull_and_check (h, h265_128x128_slice_2_idr_n_lp, -1, 0);
++  /* but expect 2 slices, both with the PTS from the input buffer */
++  pull_and_check (h, h265_128x128_slice_1_idr_n_lp, 10, 0);
++  pull_and_check (h, h265_128x128_slice_2_idr_n_lp, 10, 0);
+ 
+   /* push some more */
+   buf = wrap_buffer (h265_128x128_slice_1_idr_n_lp,
+@@ -1041,7 +1036,7 @@ GST_START_TEST (test_sliced_nal_nal)
+       sizeof (h265_128x128_slice_2_idr_n_lp), 100, 0);
+   fail_unless_equals_int (gst_harness_push (h, buf), GST_FLOW_OK);
+   fail_unless_equals_int (gst_harness_buffers_in_queue (h), 1);
+-  pull_and_check (h, h265_128x128_slice_2_idr_n_lp, -1, 0);
++  pull_and_check (h, h265_128x128_slice_2_idr_n_lp, 100, 0);
+ 
+   gst_harness_teardown (h);
+ }
+@@ -1061,9 +1056,9 @@ GST_START_TEST (test_sliced_au_nal)
+   while (gst_harness_buffers_in_queue (h) > 2)
+     pull_and_drop (h);
+ 
+-  /* but expect 2 slices */
+-  pull_and_check (h, h265_128x128_slice_1_idr_n_lp, -1, 0);
+-  pull_and_check (h, h265_128x128_slice_2_idr_n_lp, -1, 0);
++  /* Both slices from the first AU should have the PTS from the input buffer */
++  pull_and_check (h, h265_128x128_slice_1_idr_n_lp, 10, 0);
++  pull_and_check (h, h265_128x128_slice_2_idr_n_lp, 10, 0);
+ 
+   /* push some more */
+   buf = composite_buffer (100, 0, 2,
+@@ -1072,7 +1067,7 @@ GST_START_TEST (test_sliced_au_nal)
+   fail_unless_equals_int (gst_harness_push (h, buf), GST_FLOW_OK);
+   fail_unless_equals_int (gst_harness_buffers_in_queue (h), 2);
+   pull_and_check (h, h265_128x128_slice_1_idr_n_lp, 100, 0);
+-  pull_and_check (h, h265_128x128_slice_2_idr_n_lp, -1, 0);
++  pull_and_check (h, h265_128x128_slice_2_idr_n_lp, 100, 0);
+ 
+   gst_harness_teardown (h);
+ }
+diff --git a/subprojects/gst-plugins-bad/tests/check/elements/h266parse.c b/subprojects/gst-plugins-bad/tests/check/elements/h266parse.c
+index fc4f29ae6b..97e9b720ac 100644
+--- a/subprojects/gst-plugins-bad/tests/check/elements/h266parse.c
++++ b/subprojects/gst-plugins-bad/tests/check/elements/h266parse.c
+@@ -538,15 +538,10 @@ test_headers_outalign_nal (GstHarness * h)
+   pull_and_check (h, h266_sps, 10, 0);
+   pull_and_check (h, h266_pps, 10, 0);
+ 
+-  /* FIXME The timestamp should be 10 really, but base parse refuse to repeat
+-   * the same TS for two consecutive calls to _finish_frame(), see [0] for
+-   * more details. It's not a huge issue, the decoder can fix it for now.
+-   *
+-   * [0] https://gitlab.freedesktop.org/gstreamer/gstreamer/-/merge_requests/287
+-   */
+-  pull_and_check (h, h266_prefix_aps, -1, 0);
+-  pull_and_check (h, h266_idr, -1, 0);
+-  pull_and_check (h, h266_suffix_sei, -1, 0);
++  /* The remaining NAL units retain the PTS from the input buffer (same as headers) */
++  pull_and_check (h, h266_prefix_aps, 10, 0);
++  pull_and_check (h, h266_idr, 10, 0);
++  pull_and_check (h, h266_suffix_sei, 10, 0);
+ }
+ 
+ static void
+diff --git a/subprojects/gst-plugins-base/gst/rawparse/gstrawvideoparse.c b/subprojects/gst-plugins-base/gst/rawparse/gstrawvideoparse.c
+index d630040c65..42d90db3b5 100644
+--- a/subprojects/gst-plugins-base/gst/rawparse/gstrawvideoparse.c
++++ b/subprojects/gst-plugins-base/gst/rawparse/gstrawvideoparse.c
+@@ -331,6 +331,8 @@ gst_raw_video_parse_class_init (GstRawVideoParseClass * klass)
+ static void
+ gst_raw_video_parse_init (GstRawVideoParse * raw_video_parse)
+ {
++  gst_base_parse_set_allow_duplicated_pts (GST_BASE_PARSE (raw_video_parse),
++      TRUE);
+   gst_raw_video_parse_init_config (&(raw_video_parse->properties_config));
+   gst_raw_video_parse_init_config (&(raw_video_parse->sink_caps_config));
+ 
+diff --git a/subprojects/gst-plugins-good/gst/y4m/gsty4mdec.c b/subprojects/gst-plugins-good/gst/y4m/gsty4mdec.c
+index ef8287f03d..890652b046 100644
+--- a/subprojects/gst-plugins-good/gst/y4m/gsty4mdec.c
++++ b/subprojects/gst-plugins-good/gst/y4m/gsty4mdec.c
+@@ -120,6 +120,7 @@ gst_y4m_dec_class_init (GstY4mDecClass * klass)
+ static void
+ gst_y4m_dec_init (GstY4mDec * y4mdec)
+ {
++  gst_base_parse_set_allow_duplicated_pts (GST_BASE_PARSE (y4mdec), TRUE);
+ }
+ 
+ static gboolean
+diff --git a/subprojects/gstreamer/libs/gst/base/gstbaseparse.c b/subprojects/gstreamer/libs/gst/base/gstbaseparse.c
+index ebc65ea67f..8c62d5ec68 100644
+--- a/subprojects/gstreamer/libs/gst/base/gstbaseparse.c
++++ b/subprojects/gstreamer/libs/gst/base/gstbaseparse.c
+@@ -224,6 +224,7 @@ struct _GstBaseParsePrivate
+   gboolean passthrough;
+   gboolean pts_interpolate;
+   gboolean infer_ts;
++  gboolean allow_duplicated_pts;
+   gboolean syncable;
+   gboolean has_timing_info;
+   guint fps_num, fps_den;
+@@ -677,6 +678,7 @@ gst_base_parse_init (GstBaseParse * parse, GstBaseParseClass * bclass)
+   /* default parser configuration. subclasses override this in their _init() */
+   parse->priv->pts_interpolate = TRUE;
+   parse->priv->infer_ts = TRUE;
++  parse->priv->allow_duplicated_pts = FALSE;
+ 
+   GST_DEBUG_OBJECT (parse, "init ok");
+ 
+@@ -3357,6 +3359,15 @@ gst_base_parse_chain (GstPad * pad, GstObject * parent, GstBuffer * buffer)
+     if (GST_CLOCK_TIME_IS_VALID (pts) && (parse->priv->prev_pts != pts)) {
+       parse->priv->prev_pts = parse->priv->next_pts = pts;
+       updated_prev_pts = TRUE;
++    } else if (parse->priv->allow_duplicated_pts
++        && GST_CLOCK_TIME_IS_VALID (pts)) {
++      /* Set the PTS unconditionally as next PTS even if it didn't change if
++       * duplicated PTS are allowed. Without this the next output would have a
++       * PTS of GST_CLOCK_TIME_NONE instead as next_pts is always reset to
++       * GST_CLOCK_TIME_NONE when pushing a frame.
++       * The same is not necessary for the DTS below as the DTS is not reset
++       * to GST_CLOCK_TIME_NONE unconditionally. */
++      parse->priv->next_pts = pts;
+     }
+ 
+     if (GST_CLOCK_TIME_IS_VALID (dts) && (parse->priv->prev_dts != dts)) {
+@@ -4193,6 +4204,39 @@ gst_base_parse_set_infer_ts (GstBaseParse * parse, gboolean infer_ts)
+   GST_INFO_OBJECT (parse, "TS inferring: %s", (infer_ts) ? "yes" : "no");
+ }
+ 
++/**
++ * gst_base_parse_set_allow_duplicated_pts:
++ * @parse: a #GstBaseParse
++ * @allow_duplicated_pts: %TRUE if parser should allow duplicated PTS on the output
++ *
++ * By default, the base class will not allow two frames in a row to have the
++ * same PTS but instead will set the second frame's PTS to GST_CLOCK_TIME_NONE.
++ * Setting @allow_duplicated_pts would allow outputting the same PTS multiple
++ * times.
++ *
++ * For audio parsers this is generally not a good idea to allow as it can lead to
++ * unnecessary resyncs if upstream provides coarse grained timestamps and
++ * decoders and other elements generally interpolate missing timestamps based on
++ * the number of samples so missing timestamps would be fixed up later.
++ *
++ * For video parsers this generally should be allowed as various elements expect
++ * valid timestamps on all video frames and will error out or misbehave
++ * otherwise.
++ *
++ * This value is not reset during PAUSED->READY state changes. Subclasses
++ * can call this function from their instance init function.
++ *
++ * Since: 1.30
++ */
++void
++gst_base_parse_set_allow_duplicated_pts (GstBaseParse * parse,
++    gboolean allow_duplicated_pts)
++{
++  parse->priv->allow_duplicated_pts = allow_duplicated_pts;
++  GST_INFO_OBJECT (parse, "Allow duplicated PTS: %s",
++      allow_duplicated_pts ? "yes" : "no");
++}
++
+ /**
+  * gst_base_parse_set_latency:
+  * @parse: a #GstBaseParse
+@@ -5138,6 +5182,8 @@ gst_base_parse_set_ts_at_offset (GstBaseParse * parse, gsize offset)
+   }
+   if (GST_CLOCK_TIME_IS_VALID (pts) && (parse->priv->prev_pts != pts))
+     parse->priv->prev_pts = parse->priv->next_pts = pts;
++  else if (parse->priv->allow_duplicated_pts && GST_CLOCK_TIME_IS_VALID (pts))
++    parse->priv->next_pts = pts;
+ 
+   if (GST_CLOCK_TIME_IS_VALID (dts) && (parse->priv->prev_dts != dts)) {
+     parse->priv->prev_dts = parse->priv->next_dts = dts;
+diff --git a/subprojects/gstreamer/libs/gst/base/gstbaseparse.h b/subprojects/gstreamer/libs/gst/base/gstbaseparse.h
+index d821c6f630..be865beb7c 100644
+--- a/subprojects/gstreamer/libs/gst/base/gstbaseparse.h
++++ b/subprojects/gstreamer/libs/gst/base/gstbaseparse.h
+@@ -347,6 +347,9 @@ GST_BASE_API
+ void            gst_base_parse_set_infer_ts (GstBaseParse * parse,
+                                              gboolean infer_ts);
+ GST_BASE_API
++void            gst_base_parse_set_allow_duplicated_pts (GstBaseParse * parse,
++                                                         gboolean allow_duplicated_pts);
++GST_BASE_API
+ void            gst_base_parse_set_frame_rate  (GstBaseParse * parse,
+                                                 guint          fps_num,
+                                                 guint          fps_den,
+-- 
+2.55.0
+
