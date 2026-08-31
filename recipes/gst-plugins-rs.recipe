@@ -2,6 +2,7 @@
 from custom import GStreamer, running_on_cerbero_ci
 from cerbero.enums import DistroVersion, Symbolication
 from cerbero.errors import FatalError
+from cerbero.tools.libtool import LibtoolLibrary
 from cerbero.tools.pkgconfig import PkgConfigWriter
 from cerbero.utils import messages as m
 from cerbero.utils import shell
@@ -252,6 +253,7 @@ class Recipe(recipe.Recipe):
             self.workspace_pc = Path(self.config.libdir) / 'pkgconfig' / 'gstrsworkspace.pc'
             # Append the melded library
             self.files_devel.append('%(libdir)s/libgstrsworkspace.a')
+            self.files_devel.append('%(libdir)s/libgstrsworkspace.la')
             self.files_devel.append('%(libdir)s/pkgconfig/gstrsworkspace.pc')
             self.skip_pdb_files = ['%(libdir)s/libgstrsworkspace.a']
 
@@ -365,7 +367,7 @@ class Recipe(recipe.Recipe):
                         os.replace(src + '.a', dst + '.a')
 
         if self.requires_melding():
-            libs = '-L${libdir}/gstreamer-1.0 -lgstrsworkspace'
+            libs = '-L${libdir} -lgstrsworkspace'
             if self.config.target_platform == Platform.WINDOWS:
                 # Inject default libraries to cover inclusions from stdlib.
                 # The linker will seamlessly remove any unused ones.
@@ -387,6 +389,15 @@ class Recipe(recipe.Recipe):
                 libs=libs,
                 rel_libdir=self.config.rel_libdir
             ).save('gstrsworkspace', str(self.workspace_pc.parent))
+
+            # Every plugin .la lists libgstrsworkspace.la in dependency_libs (it is
+            # in their Requires.private, injected above), so consumers driving the
+            # link through a libtool implementation -- the Android ndk-build glue in
+            # share/gst-android/ndk-build/tools.mk, for one -- need the .la to exist
+            # to resolve the melded workspace archive. Without it they fall back to
+            # a plain -lgstrsworkspace and the link fails.
+            LibtoolLibrary('gstrsworkspace', None, None, None, self.config.libdir,
+                           self.config.target_platform, static_only=True).save()
 
             self.workspace_lib.unlink(missing_ok=True)
 
