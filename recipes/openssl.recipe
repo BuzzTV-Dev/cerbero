@@ -27,6 +27,9 @@ class Recipe(recipe.Recipe):
         'openssl/0001-Load-ca-certificate.crt-from-PREFIX-etc-ssl-on-macOS.patch',
         # MSVC and UWP support
         'openssl/0002-windows-makefile.tmpl-Generate-and-install-pkgconfig.patch',
+        # 32-bit Android: aes_v8_set_encrypt_key reads the round constants
+        # through an uninitialised register, so hardware AES faults
+        'openssl/0003-aesv8-armx.pl-emit-the-.Lrcon-pointer-load-on-all-32-.patch',
     ]
 
     files_bins = []

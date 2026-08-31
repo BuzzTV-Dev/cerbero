@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Maksym Vasylchuk <max@buzztv.com>
+Date: Mon, 31 Aug 2026 18:40:00 +0300
+Subject: [PATCH 3/3] aesv8-armx.pl: emit the .Lrcon pointer load on all 32-bit
+ flavours
+
+aes_v8_set_encrypt_key loads the AES round constants through $ptr, which
+on 32-bit ARM is set up by an "adr r3,.Lrcon". That instruction is emitted
+only when the perlasm flavour name matches /32/, but the android-arm target
+in Configurations/15-android.conf uses flavour "void", so the load is
+silently dropped while the rest of the function is emitted unchanged. r3
+then still holds the -2 (bad key size) sentinel from the argument checks
+above, and the first vld1.32 from it faults:
+
+  aes_v8_set_encrypt_key:
+    mvn     r3, #0x1
+    ...
+    vld1.32 {d2,d3,d4,d5}, [r3]!
+
+Every AES operation that reaches the ARMv8 crypto-extension code path on a
+32-bit Android build therefore crashes, unless the application disables
+hardware crypto entirely with OPENSSL_armcap=0.
+
+Test !~ /64/ instead, which is what every other 32-bit-only block in this
+file already does, so the flavour name no longer has to contain "32".
+---
+ crypto/aes/asm/aesv8-armx.pl | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/crypto/aes/asm/aesv8-armx.pl b/crypto/aes/asm/aesv8-armx.pl
+index 1650a0dd6f..1c31d3ad1c 100755
+--- a/crypto/aes/asm/aesv8-armx.pl
++++ b/crypto/aes/asm/aesv8-armx.pl
+@@ -152,7 +152,7 @@ $code.=<<___	if ($flavour =~ /64/);
+ 	adrp	$ptr,.Lrcon
+ 	add	$ptr,$ptr,:lo12:.Lrcon
+ ___
+-$code.=<<___	if ($flavour =~ /32/);
++$code.=<<___	if ($flavour !~ /64/);
+ 	adr	$ptr,.Lrcon
+ ___
+ $code.=<<___;
