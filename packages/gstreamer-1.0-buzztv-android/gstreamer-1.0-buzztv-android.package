@@ -1,0 +1,49 @@
+# vi:si:et:sw=4:sts=4:ts=4:syntax=python
+# -*- Mode: Python -*-
+#
+# The subset of the GStreamer SDK the BuzzTV Android app links.
+#
+# The full gstreamer-1.0 package puts every sub-package in the tarball, most of
+# which the app never references. The sub-packages below are the ones its plugin
+# list resolves to:
+#
+#   core              coreelements typefindfunctions videoconvertscale
+#                     audioconvert audioresample volume app videofilter
+#   playback          playback
+#   codecs            adaptivedemux2 icydemux id3demux isomp4 audioparsers jpeg
+#                     videoparsersbad androidmedia dvbsuboverlay subparse
+#                     teletext, and rsclosedcaption with the rust variant
+#   codecs-restricted mpegtsdemux mpegtsmux
+#   net               soup
+#   effects           closedcaption
+#   system            opengl opensles
+#   libav             libav
+#
+# Adding a plugin to the app that is not in one of these categories means adding
+# its sub-package here too, or the app will fail to link against this tarball.
+# ci/buzztv/required-plugins.txt is the list CI checks the result against.
+
+
+class SDKPackage(custom.GStreamer, package.SDKPackage):
+
+    name = 'gstreamer-1.0-buzztv-android'
+    shortdesc = 'GStreamer 1.0 for the BuzzTV Android app'
+    longdesc = 'The subset of GStreamer 1.0 that the BuzzTV Android app links'
+    title = 'GStreamer 1.0 for Android'
+    sdk_version = '1.0'
+    uuid = 'ff2ad0d9-32f6-4d0e-8b5c-6ff23a2d5f5a'
+    ignore_package_prefix = True
+
+    packages = [
+        # (name, required, selected)
+        ('gstreamer-1.0-core', True, True),
+        ('gstreamer-1.0-system', False, True),
+        ('gstreamer-1.0-playback', False, True),
+        ('gstreamer-1.0-codecs', False, True),
+        ('gstreamer-1.0-codecs-restricted', False, True),
+        ('gstreamer-1.0-net', False, True),
+        ('gstreamer-1.0-effects', False, True),
+        ('gstreamer-1.0-libav', False, True),
+    ]
+
+    root_env_var = 'GSTREAMER_1_0_ROOT_%(arch)s'
