@@ -37,7 +37,16 @@ env:
   # Skipping werror on purpose: upstream CI uses it to police GStreamer's own
   # code, and here it would only turn a warning in a third-party recipe into a
   # failed release build.
-  CERBERO_ARGS: '--timestamps --clocktime'
+  #
+  # -v debug is not redundant. config/cross-android-armv7.cbc carries upstream's
+  # variants.override('nodebug'), which the universal build never applies -- so
+  # the official prebuilts, and any local universal build, ship armv7 with debug
+  # info. Building one ABI per job does apply it, and the first release came out
+  # with armv7 stripped: libavcodec.a was 13 MB against 72 MB on the other side.
+  # That costs symbolication of GStreamer frames in armv7 crash reports, on the
+  # 32-bit boxes where they are most needed, so ask for parity explicitly. It
+  # only adds -g; optimization and assertions are unaffected either way.
+  CERBERO_ARGS: '--timestamps --clocktime -v debug'
   CERBERO_PACKAGE: 'gstreamer-1.0-buzztv-android'
 
 jobs:
