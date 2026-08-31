@@ -1,0 +1,52 @@
+From eee29b14864ef7270273ce373543fb72894fdeba Mon Sep 17 00:00:00 2001
+From: Maksym Vasylchuk <max@buzztv.com>
+Date: Mon, 31 Aug 2026 19:36:03 +0300
+Subject: [PATCH 4/4] Document the licensing of this build
+
+The license folder the Android package ships for zvbi contains COPYING.md,
+whose first clause reads "License: GPL-2+" -- someone auditing the package
+would have to read to the src/* clause further down to see that the library
+is LGPL-2+, and would still have no way to know the GPL-2 units were
+removed from the build. Record both, and what was lost with them, next to
+COPYING.md.
+---
+ LICENSING-NOTE.md | 27 +++++++++++++++++++++++++++
+ 1 file changed, 27 insertions(+)
+ create mode 100644 LICENSING-NOTE.md
+
+diff --git a/LICENSING-NOTE.md b/LICENSING-NOTE.md
+new file mode 100644
+index 0000000..a7537c7
+--- /dev/null
++++ b/LICENSING-NOTE.md
+@@ -0,0 +1,27 @@
++# Licensing of this build of libzvbi
++
++COPYING.md licenses zvbi as GPL-2+ by default and then states, separately, that
++**all files in `src/*` -- the library itself -- are LGPL-2+**, naming the
++exceptions inside `src/`: `pdc.*` and `packet-830.*` are GPL-2, `ure.*` is MIT,
++`dvb/dmx.h` and `dvb/frontend.h` are LGPL-2.1+, `videodev2k.h` is GPL-2+ or
++BSD-3-Clause, and `strptime.*` is LGPL-2.1+.
++
++This build removes `src/pdc.*` and `src/packet-830.*` from `libzvbi_la_SOURCES`,
++together with the only two references to them from LGPL code (both in
++`src/packet.c`) -- see the patch "Build libzvbi without its GPL-2 translation
++units". The library built here contains no GPL-2 object code, which is what makes
++it usable under LGPL-2+ terms.
++
++Consequently the following are absent from this build:
++
++* `vbi_decode_teletext_8301_cni`, `vbi_decode_teletext_8302_cni`,
++  `vbi_decode_teletext_8301_local_time`, `vbi_decode_teletext_8302_pdc`
++* the `vbi_pil_*` family, `vbi_pty_validity_window` and `_vbi_program_id_dump`
++* the `VBI_EVENT_LOCAL_TIME` and `VBI_EVENT_PROG_ID` events, which packet 8/30
++  used to raise
++
++Teletext page decoding, network identification from packet 8/30 (`parse_bsd`)
++and `vbi_decode_vps_pdc` -- which lives in the LGPL-2+ `src/vps.c` -- are
++unaffected.
++
++This note records what was built. It is not legal advice.
+-- 
+2.55.0
+
