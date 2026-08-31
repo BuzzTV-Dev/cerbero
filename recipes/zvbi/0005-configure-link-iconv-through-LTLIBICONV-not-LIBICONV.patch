@@ -1,0 +1,40 @@
+From d5e75576212364d783c5528b8d0a3422620986ef Mon Sep 17 00:00:00 2001
+From: Maksym Vasylchuk <max@buzztv.com>
+Date: Mon, 31 Aug 2026 22:39:36 +0300
+Subject: [PATCH] configure: link iconv through LTLIBICONV, not LIBICONV
+
+AM_ICONV_LINK sets both: LIBICONV for a direct compiler invocation, and
+LTLIBICONV for a libtool one. This is a libtool project -- src/Makefile.am
+builds libzvbi.la and links it against $(LIBS) -- so putting LIBICONV in
+LIBS hands libtool something it is entitled to rewrite.
+
+Which it does, differently depending on its version. LIBICONV is the
+absolute path of libiconv.so when the library lives outside the standard
+search path, and while libtool 2.6.2 passes that straight through, 2.4.7
+drops it from the final link line entirely. The build then fails with
+undefined libiconv, libiconv_open and libiconv_close -- but only on hosts
+with the older libtool, which is the kind of difference that survives
+local testing and fails in CI.
+
+LTLIBICONV is the form intended for exactly this: it is what gettext
+documents for use with libtool, and both versions honour it.
+---
+ configure.ac | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/configure.ac b/configure.ac
+index 38fc288..5540b22 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -321,7 +321,7 @@ AM_ICONV_LINK
+ if test "x$am_cv_func_iconv" != xyes; then
+   AC_MSG_ERROR([iconv() not found])
+ fi
+-LIBS="$LIBS $LIBICONV"
++LIBS="$LIBS $LTLIBICONV"
+ 
+ dnl
+ dnl Check for png library.
+-- 
+2.55.0
+

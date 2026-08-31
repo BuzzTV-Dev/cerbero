@@ -36,6 +36,7 @@ class Recipe(recipe.Recipe):
         f'{name}/0002-configure-accept-a-libc-that-provides-pthread-itself.patch',
         f'{name}/0003-conv-guard-nl_langinfo-on-the-function-not-just-its-.patch',
         f'{name}/0004-Document-the-licensing-of-this-build.patch',
+        f'{name}/0005-configure-link-iconv-through-LTLIBICONV-not-LIBICONV.patch',
     ]
 
     configure_options = [
