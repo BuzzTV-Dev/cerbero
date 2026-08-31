@@ -1,0 +1,13 @@
+# Pins every GStreamer recipe to the pre-patched branch that
+# tools/buzztv-prepare-gstreamer-branch.sh builds in the source clone:
+# origin/1.28 plus recipes/gstreamer-1.0/*.patch.
+#
+# It lives in its own config file because both the local universal build
+# (config/buzztv-android.cbc) and the per-ABI CI build
+# (.github/workflows/buzztv-android.yml) need it, and neither of their other
+# settings makes sense for the other.
+#
+# custom.GStreamer applies this commit to every recipe built from the monorepo,
+# which is what keeps the subprojects consistent -- see docs/buzztv-android.md
+# for why the patch cannot be a recipe `patches` entry.
+recipes_commits = {'gstreamer-1.0': 'buzztv-1.28'}
