@@ -546,6 +546,17 @@ class Recipe(custom.GStreamer):
         if self.config.target_platform != Platform.ANDROID:
             self.enable_plugin('rsvg', 'codecs', variant='rust', dep='librsvg')
 
+        if self.config.target_platform == Platform.ANDROID:
+            # The echo canceller: 47 MB of static library for a plugin an
+            # Android app that only plays and records streams never
+            # instantiates. Dropping the plugin drops webrtc-audio-processing
+            # with it, and with that one more tarball to fetch from a host that
+            # has been answering 418.
+            self.meson_options['webrtcdsp'] = 'disabled'
+            self.deps.remove('webrtc-audio-processing')
+            for attr in ('files_plugins_effects', 'files_plugins_effects_devel'):
+                setattr(self, attr, [f for f in getattr(self, attr) if 'webrtcdsp' not in f])
+
         if self.config.target_subsystem == Subsystem.TVOS_SIMULATOR and self.config.target_arch == Architecture.X86_64:
             # svtav1 plugin fails to link with the static svt-av1 lib on tvOS
             # Simulator x86_64

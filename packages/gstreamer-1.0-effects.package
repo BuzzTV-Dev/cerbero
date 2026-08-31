@@ -15,7 +15,6 @@ class Package(custom.GStreamer, package.Package):
              'soundtouch:libs',
              'qrencode:libs',
              'json-glib:libs',
-             'webrtc-audio-processing:libs',
              'gst-plugins-base-1.0:plugins_effects',
              'gst-plugins-good-1.0:plugins_effects',
              'gst-plugins-ugly-1.0:plugins_effects',
@@ -27,6 +26,11 @@ class Package(custom.GStreamer, package.Package):
             'gst-plugins-bad-1.0:plugins_effects_devel']
 
     def prepare(self):
+        # See gst-plugins-bad-1.0.recipe: webrtcdsp is not built for Android, so
+        # nothing there needs the library behind it.
+        if self.config.target_platform != Platform.ANDROID:
+            self.files.append('webrtc-audio-processing:libs')
+
         if self.config.variants.rust and \
            (self.config.target_platform != Platform.WINDOWS or \
             self.config.target_arch != Architecture.ARM64):
