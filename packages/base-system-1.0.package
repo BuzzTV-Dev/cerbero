@@ -31,4 +31,8 @@ class Package(custom.GStreamer, package.Package):
             self.files.append('gobject-introspection:libs')
 
         if self.config.variants.rust:
-            self.files += ['librsvg:libs', 'dav1d:libs']
+            self.files += ['dav1d:libs']
+            # See gst-plugins-bad-1.0.recipe: the plugin that uses librsvg is not
+            # built for Android, so nothing here needs the library either.
+            if self.config.target_platform != Platform.ANDROID:
+                self.files += ['librsvg:libs']
