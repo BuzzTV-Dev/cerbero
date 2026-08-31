@@ -1,0 +1,120 @@
+From 2eb58fbd519c0cc0964152e7ef554c136a2013c5 Mon Sep 17 00:00:00 2001
+From: Maksym Vasylchuk <max@buzztv.com>
+Date: Mon, 31 Aug 2026 19:03:56 +0300
+Subject: [PATCH 1/4] Build libzvbi without its GPL-2 translation units
+
+zvbi's COPYING.md licenses all of src/* under LGPL-2+ with a handful of
+named exceptions; src/pdc.* and src/packet-830.* are GPL-2. Those two
+units implement Programme Delivery Control and packet 8/30 decoding,
+which a teletext subtitle decoder never needs, so drop them from
+libzvbi_la_SOURCES and remove the only two references to them from LGPL
+code (both in packet.c, in the packet 8/30 handler).
+
+The resulting libzvbi.a contains no GPL-2 object code, which lets
+gst-plugins-bad's LGPL teletextdec plugin -- and anything linking it --
+be distributed under LGPL terms.
+
+pdc.h stays in LIBZVBI_HDRS: event.h and vps.h use vbi_program_id and
+vbi_pil in their own public declarations, so the generated libzvbi.h
+would not compile without those type declarations. packet-830.h is
+dropped from that list, since it only declares the removed functions.
+
+Lost with this patch: VBI_EVENT_LOCAL_TIME and VBI_EVENT_PROG_ID are no
+longer sent from packet 8/30, and vbi_pil_*, vbi_pty_validity_window,
+vbi_decode_teletext_830{1,2}_* are no longer defined. Network
+identification from packet 8/30 (parse_bsd) is unaffected, as is
+vbi_decode_vps_pdc, which lives in the LGPL vps.c.
+---
+ src/Makefile.am |  4 +---
+ src/packet.c    | 45 +++++----------------------------------------
+ 2 files changed, 6 insertions(+), 43 deletions(-)
+
+diff --git a/src/Makefile.am b/src/Makefile.am
+index 738bd38..0a37244 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -98,9 +98,8 @@ libzvbi_la_SOURCES = \
+ 	misc.c misc.h \
+ 	network.h \
+ 	packet.c teletext.c teletext_decoder.h vt.h \
+-	packet-830.c packet-830.h \
+ 	page_table.c page_table.h \
+-	pdc.c pdc.h \
++	pdc.h \
+ 	pfc_demux.c pfc_demux.h \
+ 	proxy-client.c proxy-client.h \
+ 	raw_decoder.c raw_decoder.h \
+@@ -177,7 +176,6 @@ LIBZVBI_HDRS = \
+ 	cc.h \
+ 	teletext_decoder.h \
+ 	tables.h \
+-	packet-830.h \
+ 	vps.h \
+ 	vbi.h
+ 
+diff --git a/src/packet.c b/src/packet.c
+index 848b44f..916b262 100644
+--- a/src/packet.c
++++ b/src/packet.c
+@@ -44,7 +44,6 @@
+ #include "vps.h"
+ #include "vbi.h"
+ #include "cache-priv.h"
+-#include "packet-830.h"
+ 
+ #ifndef FPC
+ #  define FPC 0
+@@ -2134,45 +2133,11 @@ parse_8_30(vbi_decoder *vbi, uint8_t *buffer, int packet)
+ 			return FALSE;
+ 	}
+ 
+-	if (designation < 2) {
+-		/* 8/30 format 1 */
+-
+-		if (vbi->event_mask & VBI_EVENT_LOCAL_TIME) {
+-			vbi_local_time lt;
+-			vbi_event e;
+-
+-			CLEAR (e);
+-
+-			if (!vbi_decode_teletext_8301_local_time
+-			    (&lt.time, &lt.seconds_east, buffer))
+-				return FALSE;
+-
+-			lt.seconds_east_valid = TRUE;
+-			lt.dst_state = VBI_DST_INCLUDED;
+-
+-			e.type = VBI_EVENT_LOCAL_TIME;
+-			e.ev.local_time	= &lt;
+-
+-			vbi_send_event (vbi, &e);
+-		}
+-	} else {
+-		/* 8/30 format 2 */
+-
+-		if (vbi->event_mask & VBI_EVENT_PROG_ID) {
+-			vbi_program_id pid;
+-			vbi_event e;
+-			
+-			if (!vbi_decode_teletext_8302_pdc (&pid, buffer))
+-				return FALSE;
+-
+-			CLEAR (e);
+-
+-			e.type = VBI_EVENT_PROG_ID;
+-			e.ev.prog_id = &pid;
+-
+-			vbi_send_event (vbi, &e);
+-		}
+-	}
++	/* The 8/30 format 1 local time and format 2 PDC decoders live in
++	   packet-830.c, which this build omits, so VBI_EVENT_LOCAL_TIME and
++	   VBI_EVENT_PROG_ID are never sent from packet 8/30. The packet's
++	   broadcaster service data (network identification) is decoded by
++	   parse_bsd() above and is unaffected. */
+ 
+ 	return TRUE;
+ }
+-- 
+2.55.0
+

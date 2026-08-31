@@ -43,6 +43,7 @@ class Recipe(custom.GStreamer):
                      'srt': 'enabled',
                      'spandsp': 'enabled',
                      'srtp': 'enabled',
+                     'teletext': 'enabled',
                      'resindvd': 'enabled',
                      'rist' : 'enabled',
                      'voaacenc': 'enabled',
@@ -78,7 +79,6 @@ class Recipe(custom.GStreamer):
                      'qsv': 'disabled',
                      'qt6d3d11': 'disabled',
                      'sndfile': 'disabled',
-                     'teletext': 'disabled',
                      'voamrwbenc': 'disabled',
                      'webview2': 'disabled',
                      'wic': 'disabled',
@@ -90,7 +90,7 @@ class Recipe(custom.GStreamer):
             'libsrtp', 'libdca', 'libdvdnav', 'libnice',
             'soundtouch', 'vo-aacenc', 'openjpeg', 'openssl',
             'pango', 'spandsp', 'webrtc-audio-processing', 'sbc', 'ladspa',
-            'srt', 'zbar', 'libltc', 'qrencode', 'json-glib']
+            'srt', 'zbar', 'libltc', 'qrencode', 'json-glib', 'zvbi']
     platform_deps = {
         Platform.LINUX: ['libdrm']
     }
@@ -272,6 +272,7 @@ class Recipe(custom.GStreamer):
              '%(libdir)s/gstreamer-1.0/libgstsiren%(mext)s',
              '%(libdir)s/gstreamer-1.0/libgstsmoothstreaming%(mext)s',
              '%(libdir)s/gstreamer-1.0/libgstsubenc%(mext)s',
+             '%(libdir)s/gstreamer-1.0/libgstteletext%(mext)s',
              '%(libdir)s/gstreamer-1.0/libgstvideoparsersbad%(mext)s',
              '%(libdir)s/gstreamer-1.0/libgstjpegformat%(mext)s',
              '%(libdir)s/gstreamer-1.0/libgstgdp%(mext)s',
@@ -306,6 +307,7 @@ class Recipe(custom.GStreamer):
              '%(libdir)s/gstreamer-1.0/libgstsiren.a', '%(libdir)s/gstreamer-1.0/libgstsiren.la',
              '%(libdir)s/gstreamer-1.0/libgstsmoothstreaming.a', '%(libdir)s/gstreamer-1.0/libgstsmoothstreaming.la',
              '%(libdir)s/gstreamer-1.0/libgstsubenc.a', '%(libdir)s/gstreamer-1.0/libgstsubenc.la',
+             '%(libdir)s/gstreamer-1.0/libgstteletext.a', '%(libdir)s/gstreamer-1.0/libgstteletext.la',
              '%(libdir)s/gstreamer-1.0/libgsttranscode.a', '%(libdir)s/gstreamer-1.0/libgsttranscode.la',
              '%(libdir)s/gstreamer-1.0/libgstvideoparsersbad.a', '%(libdir)s/gstreamer-1.0/libgstvideoparsersbad.la',
              '%(libdir)s/gstreamer-1.0/libgstjpegformat.a', '%(libdir)s/gstreamer-1.0/libgstjpegformat.la',

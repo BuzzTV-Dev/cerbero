@@ -1,0 +1,123 @@
+# -*- Mode: Python -*- vi:si:et:sw=4:sts=4:ts=4:syntax=python
+import os
+import re
+import shutil
+import subprocess
+from pathlib import Path
+
+from cerbero.errors import FatalError
+from cerbero.tools.libtool import LibtoolLibrary
+
+
+class Recipe(recipe.Recipe):
+    name = 'zvbi'
+    version = '0.2.45'
+    # zvbi's COPYING.md puts all of src/* -- the library -- under LGPL-2+, with
+    # src/pdc.* and src/packet-830.* as GPL-2 exceptions. The patch below drops
+    # those two translation units, so the archive this recipe installs carries no
+    # GPL-2 object code and gst-plugins-bad's LGPL teletextdec can be linked into
+    # a closed-source application.
+    licenses = [{License.LGPLv2Plus: ['COPYING.md', 'LICENSING-NOTE.md']}]
+    stype = SourceType.TARBALL
+    # The releases carry only a signature as an asset; the source is the tag archive.
+    url = 'https://github.com/zapping-vbi/%(name)s/archive/refs/tags/v%(version)s.tar.gz'
+    tarball_checksum = 'e6c954fde2a5a635187f19e1ab870a88c1a982012c5f1b33b8f2513e0ab7a50e'
+    tarball_dirname = '%(name)s-%(version)s'
+    # A tag archive is the bare repository, so configure has to be generated.
+    autoreconf = True
+
+    # conv.c needs iconv; exp-gfx's PNG page export picks up libpng if it is
+    # visible, and configure appends -lpng -lz to the Libs of zvbi-0.2.pc when it
+    # does, so both have to be real dependencies rather than incidental ones.
+    deps = ['libiconv', 'libpng', 'zlib']
+
+    patches = [
+        f'{name}/0001-Build-libzvbi-without-its-GPL-2-translation-units.patch',
+        f'{name}/0002-configure-accept-a-libc-that-provides-pthread-itself.patch',
+        f'{name}/0003-conv-guard-nl_langinfo-on-the-function-not-just-its-.patch',
+        f'{name}/0004-Document-the-licensing-of-this-build.patch',
+    ]
+
+    configure_options = [
+        # Capture backends: all of them are Linux/BSD device I/O that cannot work
+        # on Android, and the proxy also builds a daemon.
+        '--disable-v4l',
+        '--disable-dvb',
+        '--disable-bktr',
+        '--disable-proxy',
+        '--disable-tests',
+        '--disable-examples',
+        '--without-doxygen',
+        # Keeps gettext's lib-link.m4 from recording a -Wl,-rpath into this build
+        # machine's libdir in LIBS, which the @LIBS@ substitution would copy into
+        # zvbi-0.2.pc. It does not stop that macro from linking iconv by absolute
+        # path; post_install() below deals with that part.
+        '--disable-rpath',
+        # AM_GNU_GETTEXT([external]) would otherwise add a libintl dependency for
+        # message catalogues nothing on Android reads.
+        '--disable-nls',
+    ]
+
+    files_libs = ['libzvbi']
+    files_devel = ['include/libzvbi.h', '%(libdir)s/pkgconfig/zvbi-0.2.pc']
+
+    # configure.ac says AC_PREREQ([2.71]) and means it. Under the autoconf 2.69
+    # that cerbero's build tools pin, the multi-line argument of AC_CHECK_HEADERS
+    # expands into a `for ac_header in ...` list with embedded newlines and the
+    # generated configure dies with "syntax error near unexpected token
+    # `malloc.h'". So generate configure with the host autotools; nothing of them
+    # ends up in the build output, which still comes from cerbero's toolchain.
+    MIN_AUTOCONF = (2, 71)
+
+    def prepare(self):
+        autoreconf = shutil.which('autoreconf')
+        if not autoreconf:
+            raise FatalError('zvbi needs autoconf on the host to generate its configure script')
+        version = self._host_autoconf_version(autoreconf)
+        if version < self.MIN_AUTOCONF:
+            raise FatalError(
+                'zvbi needs host autoconf {} or newer to generate its configure script, found {}'.format(
+                    '.'.join(str(v) for v in self.MIN_AUTOCONF), '.'.join(str(v) for v in version)
+                )
+            )
+        # autoreconf drives aclocal/automake/autopoint through PATH, so the whole
+        # host toolchain has to come ahead of cerbero's build tools, not just this
+        # one binary.
+        self.autoreconf_sh = 'PATH={}:$PATH {} -f -i'.format(os.path.dirname(autoreconf), autoreconf)
+
+        # AC_FUNC_MALLOC and AC_FUNC_REALLOC probe by running a program, so when
+        # cross compiling they assume the non-GNU behaviour and #define malloc and
+        # realloc to rpl_malloc and rpl_realloc -- replacements zvbi does not
+        # implement, leaving an undefined rpl_realloc at link time. Bionic's are
+        # GNU-compatible. config/windows.config does the same for the same reason.
+        self.set_env('ac_cv_func_malloc_0_nonnull', 'yes')
+        self.set_env('ac_cv_func_realloc_0_nonnull', 'yes')
+
+    def post_install(self):
+        # gettext's lib-link.m4 links iconv by the absolute path of libiconv.so
+        # rather than -L/-liconv, and libtool and the @LIBS@ substitution copy that
+        # path into libzvbi.la and zvbi-0.2.pc. Both files are shipped, the path is
+        # this build machine's, and the Android package contains no shared
+        # libraries at all -- so a consumer resolving either one (the ndk-build
+        # libtool emulation that links libgstreamer_android.so, for one) would look
+        # for a file that does not exist. Rewrite both the way every other cerbero
+        # recipe records its dependencies.
+        LibtoolLibrary(
+            'zvbi', None, None, None, self.config.libdir, self.config.target_platform,
+            deps=['iconv', 'png16', 'z', '-lm'],
+        ).save()
+
+        pc = Path(self.config.libdir) / 'pkgconfig' / 'zvbi-0.2.pc'
+        text = pc.read_text()
+        text = re.sub(r'\S+/libiconv\.(?:so|a)[.0-9]*', '-liconv', text)
+        text = re.sub(r'-Wl,-rpath\s+-Wl,\S+', '', text)
+        text = re.sub(r'[ \t]{2,}', ' ', text)
+        pc.write_text(text)
+
+        super().post_install()
+
+    def _host_autoconf_version(self, autoreconf):
+        out = subprocess.check_output([autoreconf, '--version'], text=True)
+        # "autoreconf (GNU Autoconf) 2.73"
+        number = out.splitlines()[0].split()[-1]
+        return tuple(int(part) for part in number.split('.')[:2])
