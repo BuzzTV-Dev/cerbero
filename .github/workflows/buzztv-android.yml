@@ -1,0 +1,233 @@
+# Builds the GStreamer Android tarball the app links against, and publishes it
+# where the app's fetch script can download it.
+#
+# This mirrors what .gitlab-ci.yml's "cerbero cross-android universal" job does
+# -- bootstrap, fetch, package -- with three differences:
+#
+#   * it builds packages/gstreamer-1.0-buzztv-android, not the full gstreamer-1.0
+#     SDK, so the sub-packages nothing in the app references are never built;
+#   * it builds one ABI per job instead of the universal config in one job, so
+#     each job fits comfortably inside a GitHub runner's 6 hour limit, and
+#     ci/buzztv/assemble-universal.sh puts the halves back into the universal
+#     layout afterwards;
+#   * it publishes a release asset, because artifacts need a token to download
+#     and the app's fetch script wants a plain URL.
+name: Android build
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish the tarball as a release (otherwise it is only a workflow artifact)'
+        type: boolean
+        default: false
+      release_tag:
+        description: 'Tag for the release, e.g. android-1.28.6.1-1. Defaults to android-<version>-<run number>.'
+        type: string
+        default: ''
+  push:
+    tags:
+      # Pushing a tag of this shape builds and publishes.
+      - 'android-*'
+
+permissions:
+  contents: read
+
+env:
+  # Skipping werror on purpose: upstream CI uses it to police GStreamer's own
+  # code, and here it would only turn a warning in a third-party recipe into a
+  # failed release build.
+  CERBERO_ARGS: '--timestamps --clocktime'
+  CERBERO_PACKAGE: 'gstreamer-1.0-buzztv-android'
+
+jobs:
+  build:
+    name: build ${{ matrix.abi }}
+    runs-on: ubuntu-24.04
+    # A hosted runner has few cores and starts with a cold ccache. Six hours is
+    # the hard ceiling for a job, so leave room to still upload logs when a build
+    # overruns.
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # cerbero's arch names, which are also the directory names inside the
+          # tarball, and what the app maps arm64-v8a and armeabi-v7a to.
+          - abi: arm64
+            config: cross-android-arm64.cbc
+          - abi: armv7
+            config: cross-android-armv7.cbc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free up disk space
+        # The build tree, sources, NDK and Rust toolchains come to ~25 GB, and a
+        # stock runner has around 25 GB free. These four are the big
+        # preinstalled things this build never touches -- cerbero downloads its
+        # own NDK rather than using the runner's Android SDK.
+        run: |
+          set -x
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.ccache
+          # Per ABI: the two builds share no object files. The run number in the
+          # key makes every run save a fresh entry, and restore-keys falls back
+          # to the newest previous one.
+          key: ccache-${{ matrix.abi }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ matrix.abi }}-
+
+      - name: Write the CI cerbero config
+        # config/buzztv-android.cbc is for the local universal build and lists
+        # universal_archs, which a per-ABI CI build does not want. All it needs is
+        # somewhere to put the build tree.
+        run: |
+          set -eux
+          cat > ci-localconf.cbc <<EOF
+          home_dir = '${{ github.workspace }}/cb'
+          local_sources = '${{ github.workspace }}/cerbero-sources'
+          use_ccache = True
+          num_of_cpus = $(nproc)
+          EOF
+          cat ci-localconf.cbc
+
+      - name: Set up the environment
+        run: |
+          set -eux
+          echo "CCACHE_DIR=${{ github.workspace }}/.ccache" >> "$GITHUB_ENV"
+          echo "CCACHE_MAXSIZE=3G" >> "$GITHUB_ENV"
+          echo "CCACHE_COMPRESS=true" >> "$GITHUB_ENV"
+          echo "CCACHE_COMPILERCHECK=content" >> "$GITHUB_ENV"
+          # The version cerbero will stamp on the tarball, so later steps and
+          # the assemble job agree on the file name.
+          version=$(sed -n "s/^CERBERO_VERSION = '\(.*\)'/\1/p" cerbero/enums.py)
+          echo "GST_VERSION=${version}" >> "$GITHUB_ENV"
+          echo "CERBERO=./cerbero-uninstalled -c config/${{ matrix.config }} -c config/buzztv-gstreamer-branch.cbc -c ci-localconf.cbc" >> "$GITHUB_ENV"
+          # Without the branch pin: used only for the first fetch, which is what
+          # creates the clone the pinned branch is built in.
+          echo "CERBERO_UNPINNED=./cerbero-uninstalled -c config/${{ matrix.config }} -c ci-localconf.cbc" >> "$GITHUB_ENV"
+
+      - name: Refresh the package index
+        # cerbero's Debian bootstrapper runs apt-get install without an
+        # apt-get update first -- reasonable against the prepared images the
+        # GitLab CI uses, but a runner's index can be older than the mirrors it
+        # points at, and then install fails with exit 100 instead of resolving.
+        run: sudo apt-get update
+
+      - name: Bootstrap
+        # --system=yes lets cerbero's own Debian bootstrapper install the host
+        # packages, so the list stays in one place (cerbero/bootstrap/linux.py)
+        # instead of being duplicated here. It also brings the autoconf 2.71 and
+        # autopoint that recipes/zvbi.recipe needs on the host.
+        run: |
+          set -eux
+          $CERBERO $CERBERO_ARGS show-config
+          $CERBERO $CERBERO_ARGS fetch-bootstrap --jobs=8
+          $CERBERO $CERBERO_ARGS bootstrap --system=yes --assume-yes
+
+      - name: Build the pre-patched gstreamer branch
+        # Chicken and egg: the pinned commit does not exist until the script
+        # creates it, and the script needs the clone the fetch creates. So fetch
+        # once unpinned, then build the branch, then everything else is pinned.
+        run: |
+          set -eux
+          $CERBERO_UNPINNED $CERBERO_ARGS fetch gstreamer-1.0 --jobs=8
+          ./tools/buzztv-prepare-gstreamer-branch.sh "${{ github.workspace }}/cerbero-sources/gstreamer-1.0"
+
+      - name: Fetch sources
+        run: $CERBERO $CERBERO_ARGS fetch-package --jobs=8 --deps "$CERBERO_PACKAGE"
+
+      - name: Package
+        # --offline proves the fetch step got everything; a recipe that reaches
+        # for the network during the build fails here rather than flaking later.
+        run: |
+          set -eux
+          $CERBERO $CERBERO_ARGS package --offline -o "$(pwd)" "$CERBERO_PACKAGE"
+          ls -lh ./*.tar.xz
+          ccache -s || true
+
+      - name: Upload the ABI tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: gstreamer-${{ matrix.abi }}
+          # The devel tarball, which is the one with the static archives, the
+          # .la files and share/gst-android/ndk-build. The -runtime one has no
+          # use here.
+          path: ${{ env.CERBERO_PACKAGE }}-android-${{ matrix.abi }}-${{ env.GST_VERSION }}.tar.xz
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ matrix.abi }}
+          path: |
+            cb/logs/**
+            ci-localconf.cbc
+          if-no-files-found: ignore
+          retention-days: 7
+
+  assemble:
+    name: assemble and publish
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      # For the release upload below. The build jobs stay read-only.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: gstreamer-*
+          path: abi-tarballs
+
+      - name: Assemble the universal tarball
+        run: |
+          set -eux
+          version=$(sed -n "s/^CERBERO_VERSION = '\(.*\)'/\1/p" cerbero/enums.py)
+          echo "GST_VERSION=${version}" >> "$GITHUB_ENV"
+          ./ci/buzztv/assemble-universal.sh "${version}" dist \
+            "arm64:$(ls abi-tarballs/gstreamer-arm64/*.tar.xz)" \
+            "armv7:$(ls abi-tarballs/gstreamer-armv7/*.tar.xz)"
+
+      - name: Upload the universal tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: gstreamer-1.0-android-universal-${{ env.GST_VERSION }}
+          path: |
+            dist/gstreamer-1.0-android-universal-${{ env.GST_VERSION }}.tar.xz
+            dist/gstreamer-1.0-android-universal-${{ env.GST_VERSION }}.tar.xz.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish a release
+        # A workflow artifact needs a token and an API call to fetch, which is
+        # awkward for a build script; a release asset on a public repo is a
+        # plain URL. Publishing is opt-in for a manual run and automatic for a
+        # tag push.
+        if: github.event_name == 'push' || inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.release_tag }}
+        run: |
+          set -eux
+          tag="${TAG:-android-${GST_VERSION}-${{ github.run_number }}}"
+          notes="GStreamer ${GST_VERSION} for Android (arm64, armv7), built from ${GITHUB_SHA}.
+
+          The subset the app links -- see packages/gstreamer-1.0-buzztv-android
+          and docs/buzztv-android.md. Point the app's fetch script at the asset
+          below and set its expected SHA256 from the .sha256 file."
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            gh release upload "${tag}" dist/* --clobber
+          else
+            gh release create "${tag}" dist/* --title "GStreamer ${GST_VERSION} for Android" --notes "${notes}"
+          fi
+          gh release view "${tag}" --json assets --jq '.assets[].url'

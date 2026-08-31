@@ -1,0 +1,39 @@
+# The plugins the app links into its libgstreamer_android.so, from the
+# GSTREAMER_PLUGINS list in its ndk-build makefile. CI checks that every one of
+# them is in the tarball it publishes, so that dropping a sub-package from
+# packages/gstreamer-1.0-buzztv-android/ -- or a plugin from a recipe -- fails
+# the build here instead of failing the app's link later.
+#
+# Keep in step with the app: both its ndk-build plugin list and the runtime list
+# that registers the static plugins.
+coreelements
+typefindfunctions
+playback
+soup
+adaptivedemux2
+icydemux
+id3demux
+mpegtsdemux
+mpegtsmux
+isomp4
+videoparsersbad
+audioparsers
+androidmedia
+videoconvertscale
+jpeg
+opengl
+opensles
+audioconvert
+audioresample
+volume
+libav
+app
+subparse
+closedcaption
+dvbsuboverlay
+videofilter
+# Not linked by the app yet: teletextdec needs a licensing sign-off, and
+# rsclosedcaption (cea608tojson) needs the app to add it. Both are built and
+# shipped, so check them here to keep them from silently regressing.
+teletext
+rsclosedcaption
