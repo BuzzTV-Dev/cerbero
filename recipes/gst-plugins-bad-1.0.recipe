@@ -539,7 +539,12 @@ class Recipe(custom.GStreamer):
         self.enable_plugin('msdk', 'codecs', 'intelmsdk')
         self.enable_plugin('va', 'codecs', 'va', dep='libva')
 
-        self.enable_plugin('rsvg', 'codecs', variant='rust', dep='librsvg')
+        # librsvg is by far the largest thing in an Android package -- 297 MB of
+        # static archive on arm64, plus one of the longest Rust builds -- and the
+        # rsvg overlay plugin it backs is not something an Android app has any
+        # use for. Everything else in this recipe stays as upstream has it.
+        if self.config.target_platform != Platform.ANDROID:
+            self.enable_plugin('rsvg', 'codecs', variant='rust', dep='librsvg')
 
         if self.config.target_subsystem == Subsystem.TVOS_SIMULATOR and self.config.target_arch == Architecture.X86_64:
             # svtav1 plugin fails to link with the static svt-av1 lib on tvOS
