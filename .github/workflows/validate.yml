@@ -1,0 +1,140 @@
+# Fast checks for pull requests. Nothing here builds GStreamer -- the Android
+# build takes hours and lives in buzztv-android.yml, triggered by hand or by an
+# android-* tag. This job exists so that a PR touching a recipe, a package
+# definition or the CI scripts gets *some* signal within a couple of minutes,
+# rather than none at all until someone remembers to dispatch a build.
+#
+# The rule for adding a check here: it must fail on something a human would
+# otherwise discover hours into a build, and it must not need a toolchain.
+name: Validate
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - buzztv-1.28
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Workflow files parse
+        run: |
+          set -eux
+          # A GitHub runner ships PyYAML; a local runner image may not, and this
+          # job should behave the same in both. apt rather than pip: the system
+          # Python is externally managed, and pip refuses it (PEP 668).
+          python3 -c 'import yaml' 2>/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq python3-yaml; }
+          for f in .github/workflows/*.yml; do
+            python3 -c "import sys, yaml; yaml.safe_load(open(sys.argv[1]))" "$f"
+          done
+
+      - name: Recipes and packages are syntactically valid Python
+        # They are not importable on their own -- they run inside cerbero's own
+        # namespace, with `recipe`, `custom`, `License` and friends injected --
+        # but a syntax error is a syntax error, and this catches one in seconds
+        # instead of at the extract step of a build.
+        run: |
+          set -eu
+          status=0
+          for f in recipes/*.recipe packages/*.package packages/*/*.package; do
+            python3 -c "import sys; compile(open(sys.argv[1]).read(), sys.argv[1], 'exec')" "$f" || status=1
+          done
+          exit $status
+
+      - name: cerbero loads every Android configuration
+        # Loading a config parses every recipe and package file, so this catches
+        # a broken .cbc, a recipe that fails at class definition time, and a
+        # package whose name or dependencies do not resolve. It needs no
+        # toolchain: nothing is fetched or built.
+        run: |
+          set -eux
+          # The two combinations that are actually used, and only those. Adding
+          # buzztv-android.cbc to a per-ABI config sets universal_archs on a
+          # build that has no arch map to apply it to, and cerbero fails with an
+          # opaque "sequence item 0: expected str instance, NoneType found".
+          ./cerbero-uninstalled -c config/cross-android-universal.cbc \
+                                -c config/buzztv-gstreamer-branch.cbc \
+                                -c config/buzztv-android.cbc \
+                                show-config > /dev/null
+          for cfg in cross-android-arm64.cbc cross-android-armv7.cbc; do
+            ./cerbero-uninstalled -c "config/${cfg}" \
+                                  -c config/buzztv-gstreamer-branch.cbc \
+                                  show-config > /dev/null
+          done
+
+      - name: The Android package is registered
+        run: |
+          set -eux
+          ./cerbero-uninstalled -c config/cross-android-universal.cbc \
+                                -c config/buzztv-gstreamer-branch.cbc \
+                                -c config/buzztv-android.cbc \
+                                list-packages | awk '{print $1}' | grep -qx gstreamer-1.0-buzztv-android
+
+      - name: Every required plugin is named by a recipe
+        # required-plugins.txt is what the build is checked against at the end of
+        # a run. A typo in it turns into a failure hours later, at the assemble
+        # step, having already paid for two builds -- so check here that each
+        # name is one some recipe actually installs.
+        run: |
+          set -eu
+          status=0
+          while read -r plugin; do
+            case "${plugin}" in ''|\#*) continue ;; esac
+            # Either a file list naming the built plugin, or -- for gst-plugins-rs,
+            # which derives its file lists from cargo_packages at prepare() time --
+            # the bare name in that recipe's plugin table.
+            if ! grep -rqE "libgst${plugin}([^a-zA-Z0-9_]|$)|'${plugin}'" recipes/ ; then
+              echo "ERROR: no recipe installs libgst${plugin}, named in ci/buzztv/required-plugins.txt" >&2
+              status=1
+            fi
+          done < ci/buzztv/required-plugins.txt
+          exit $status
+
+      - name: Shell scripts
+        run: |
+          set -eux
+          # Same reasoning as PyYAML above: a GitHub runner ships shellcheck, a
+          # local runner image may not.
+          command -v shellcheck >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck; }
+          bash -n ci/buzztv/assemble-universal.sh
+          sh -n tools/buzztv-prepare-gstreamer-branch.sh
+          # Errors only: this is a correctness gate, not a style one.
+          shellcheck -S error ci/buzztv/assemble-universal.sh tools/buzztv-prepare-gstreamer-branch.sh
+
+      - name: assemble-universal.sh accepts a good tree and rejects a bad one
+        # The one piece of CI logic with real behaviour in it, and the one that
+        # only ever runs at the end of a multi-hour build. Exercised here against
+        # synthetic per-ABI tarballs: it must produce the arm64/ + armv7/ layout
+        # the app extracts, and must refuse to publish when a plugin is missing.
+        run: |
+          set -eux
+          work=$(mktemp -d)
+          for abi in arm64 armv7; do
+            mkdir -p "$work/$abi/lib/pkgconfig" "$work/$abi/lib/gstreamer-1.0" "$work/$abi/share/gst-android/ndk-build"
+            touch "$work/$abi/share/gst-android/ndk-build/gstreamer-1.0.mk"
+            grep -v '^#' ci/buzztv/required-plugins.txt | grep -v '^$' | while read -r p; do
+              touch "$work/$abi/lib/gstreamer-1.0/libgst$p.a" "$work/$abi/lib/gstreamer-1.0/libgst$p.la"
+            done
+            tar -cf "$work/$abi.tar" -C "$work/$abi" .
+          done
+
+          ./ci/buzztv/assemble-universal.sh 0.0.0 "$work/out" "arm64:$work/arm64.tar" "armv7:$work/armv7.tar"
+          test -f "$work/out/gstreamer-1.0-android-universal-0.0.0.tar.xz"
+          test -f "$work/out/gstreamer-1.0-android-universal-0.0.0.tar.xz.sha256"
+          tar -tf "$work/out/gstreamer-1.0-android-universal-0.0.0.tar.xz" | awk -F/ '{print $1}' | sort -u | tr '\n' ' ' | grep -qx 'arm64 armv7 '
+
+          # Same inputs, one .la removed: it must refuse rather than publish.
+          rm "$work/armv7/lib/gstreamer-1.0/libgstcoreelements.la"
+          tar -cf "$work/armv7.tar" -C "$work/armv7" .
+          if ./ci/buzztv/assemble-universal.sh 0.0.0 "$work/out2" "arm64:$work/arm64.tar" "armv7:$work/armv7.tar"; then
+            echo "ERROR: assemble-universal.sh published a tree with a missing .la" >&2
+            exit 1
+          fi
