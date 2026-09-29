@@ -319,7 +319,13 @@ adb shell dumpsys media.audio_policy | grep -A30 -i hdmi   # the output's channe
 adb shell dumpsys media.audio_flinger | grep -iE 'channel (count|mask)|format'   # what the track actually got
 ```
 
-If the profile is stereo only, Android downmixes whatever the sink sends.
+If the profile is stereo only, Android downmixes whatever the sink sends. The
+p6 (rk3588, API 33) is such a box. Its only PCM mix port, `primary output`,
+is PCM 16-bit, 44.1/48 kHz, mask `0x3`. Its HDMI `hdmi_bitstream` direct port
+takes AC-3, E-AC-3 (JOC too), DTS, DTS-HD and IEC 61937 up to 192 kHz. So on
+the p6 a 5.1 track opens with mask `0xfc` and is mixed down to stereo, and
+passthrough through `audiotracksink` is the only way to get more than two
+channels to a receiver.
 
 ## What the trimming is worth
 
