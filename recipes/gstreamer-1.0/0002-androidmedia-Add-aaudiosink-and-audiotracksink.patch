@@ -1,4 +1,4 @@
-From 25ea46a4f2ea2f5d45e660bfbe76fe67ff6bfb54 Mon Sep 17 00:00:00 2001
+From cc85d0f362452ed1d57043544f9437ddd630832b Mon Sep 17 00:00:00 2001
 From: Maksym Vasylchuk <max@buzztv.com>
 Date: Tue, 29 Sep 2026 19:19:51 +0300
 Subject: [PATCH] androidmedia: Add aaudiosink and audiotracksink
@@ -13,15 +13,15 @@ audiotracksink makes every JNI call on one thread it owns.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- .../sys/androidmedia/gstaaudiosink.c          |  739 ++++++++++
+ .../sys/androidmedia/gstaaudiosink.c          |  869 +++++++++++
  .../sys/androidmedia/gstaaudiosink.h          |   36 +
  .../gst-plugins-bad/sys/androidmedia/gstamc.c |   10 +
  .../sys/androidmedia/gstandroidaudio.c        |  290 ++++
  .../sys/androidmedia/gstandroidaudio.h        |   68 +
- .../sys/androidmedia/gstaudiotracksink.c      | 1225 +++++++++++++++++
+ .../sys/androidmedia/gstaudiotracksink.c      | 1320 +++++++++++++++++
  .../sys/androidmedia/gstaudiotracksink.h      |   36 +
  .../sys/androidmedia/meson.build              |    6 +
- 8 files changed, 2410 insertions(+)
+ 8 files changed, 2635 insertions(+)
  create mode 100644 subprojects/gst-plugins-bad/sys/androidmedia/gstaaudiosink.c
  create mode 100644 subprojects/gst-plugins-bad/sys/androidmedia/gstaaudiosink.h
  create mode 100644 subprojects/gst-plugins-bad/sys/androidmedia/gstandroidaudio.c
@@ -31,10 +31,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 
 diff --git a/subprojects/gst-plugins-bad/sys/androidmedia/gstaaudiosink.c b/subprojects/gst-plugins-bad/sys/androidmedia/gstaaudiosink.c
 new file mode 100644
-index 0000000000..11fffcfc7e
+index 0000000000..9581fca9a8
 --- /dev/null
 +++ b/subprojects/gst-plugins-bad/sys/androidmedia/gstaaudiosink.c
-@@ -0,0 +1,739 @@
+@@ -0,0 +1,869 @@
 +/*
 + * Copyright (C) 2026 BuzzTV
 + *
@@ -153,7 +153,14 @@ index 0000000000..11fffcfc7e
 +{
 +  GstAudioSink parent;
 +
++  /* with the object lock */
 +  gboolean passthrough;
++  gdouble volume;
++  gboolean mute;
++
++  /* The writer's copy of the data when a gain has to be applied. */
++  guint8 *scratch;
++  gsize scratch_size;
 +
 +  /* Protects everything below: delay() and pause()/stop() come from other
 +   * threads than the writer. */
@@ -172,15 +179,21 @@ index 0000000000..11fffcfc7e
 +   * E-AC-3, where one ring buffer frame is four IEC 61937 frames. */
 +  gint device_bpf;
 +  gint ring_bpf;
++  gboolean iec61937;
++  GstAudioFormat pcm_format;
 +};
 +
 +enum
 +{
 +  PROP_0,
 +  PROP_PASSTHROUGH,
++  PROP_VOLUME,
++  PROP_MUTE,
 +};
 +
 +#define DEFAULT_PASSTHROUGH FALSE
++#define DEFAULT_VOLUME 1.0
++#define DEFAULT_MUTE FALSE
 +
 +#define PCM_FORMATS "{ F32LE, S16LE, S32LE, S24LE }"
 +#define PCM_STRUCTURE(n, mask) \
@@ -212,8 +225,11 @@ index 0000000000..11fffcfc7e
 +        "block-size = (int) { 512, 1024, 2048 }, "
 +        "rate = (int) { 32000, 44100, 48000 }"));
 +
++static void gst_aaudio_sink_volume_changed (GstAAudioSink * self);
++
 +#define gst_aaudio_sink_parent_class parent_class
-+G_DEFINE_TYPE (GstAAudioSink, gst_aaudio_sink, GST_TYPE_AUDIO_SINK);
++G_DEFINE_TYPE_WITH_CODE (GstAAudioSink, gst_aaudio_sink, GST_TYPE_AUDIO_SINK,
++    G_IMPLEMENT_INTERFACE (GST_TYPE_STREAM_VOLUME, NULL));
 +
 +static const gchar *
 +result_text (aaudio_result_t result)
@@ -234,6 +250,18 @@ index 0000000000..11fffcfc7e
 +      self->passthrough = g_value_get_boolean (value);
 +      GST_OBJECT_UNLOCK (self);
 +      break;
++    case PROP_VOLUME:
++      GST_OBJECT_LOCK (self);
++      self->volume = g_value_get_double (value);
++      GST_OBJECT_UNLOCK (self);
++      gst_aaudio_sink_volume_changed (self);
++      break;
++    case PROP_MUTE:
++      GST_OBJECT_LOCK (self);
++      self->mute = g_value_get_boolean (value);
++      GST_OBJECT_UNLOCK (self);
++      gst_aaudio_sink_volume_changed (self);
++      break;
 +    default:
 +      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
 +      break;
@@ -250,6 +278,16 @@ index 0000000000..11fffcfc7e
 +    case PROP_PASSTHROUGH:
 +      GST_OBJECT_LOCK (self);
 +      g_value_set_boolean (value, self->passthrough);
++      GST_OBJECT_UNLOCK (self);
++      break;
++    case PROP_VOLUME:
++      GST_OBJECT_LOCK (self);
++      g_value_set_double (value, self->volume);
++      GST_OBJECT_UNLOCK (self);
++      break;
++    case PROP_MUTE:
++      GST_OBJECT_LOCK (self);
++      g_value_set_boolean (value, self->mute);
 +      GST_OBJECT_UNLOCK (self);
 +      break;
 +    default:
@@ -407,7 +445,10 @@ index 0000000000..11fffcfc7e
 +    self->channels = 2;
 +    self->channel_mask = 0;
 +    self->device_bpf = 4;
++    self->iec61937 = TRUE;
 +  } else {
++    self->iec61937 = FALSE;
++    self->pcm_format = GST_AUDIO_INFO_FORMAT (&spec->info);
 +    switch (GST_AUDIO_INFO_FORMAT (&spec->info)) {
 +      case GST_AUDIO_FORMAT_S16LE:
 +        self->format = AAUDIO_FORMAT_PCM_I16;
@@ -475,6 +516,75 @@ index 0000000000..11fffcfc7e
 +  return g_atomic_int_get (&buf->state) == GST_AUDIO_RING_BUFFER_STATE_STARTED;
 +}
 +
++/* Applied at the next write: AAudio has no volume control of its own. */
++static void
++gst_aaudio_sink_volume_changed (GstAAudioSink * self)
++{
++}
++
++/* Returns @data, or a copy of it with @gain applied. Passthrough data is
++ * never scaled, only silenced. */
++static const guint8 *
++apply_gain (GstAAudioSink * self, const guint8 * data, guint length,
++    gdouble gain)
++{
++  guint i;
++
++  if (self->iec61937 && gain > 0.0)
++    return data;
++
++  if (self->scratch_size < length) {
++    g_free (self->scratch);
++    self->scratch = g_malloc (length);
++    self->scratch_size = length;
++  }
++
++  if (gain <= 0.0) {
++    memset (self->scratch, 0, length);
++    return self->scratch;
++  }
++
++  switch (self->pcm_format) {
++    case GST_AUDIO_FORMAT_F32LE:{
++      const gfloat *in = (const gfloat *) data;
++      gfloat *out = (gfloat *) self->scratch;
++
++      for (i = 0; i < length / 4; i++)
++        out[i] = in[i] * gain;
++      break;
++    }
++    case GST_AUDIO_FORMAT_S16LE:{
++      const gint16 *in = (const gint16 *) data;
++      gint16 *out = (gint16 *) self->scratch;
++
++      for (i = 0; i < length / 2; i++)
++        out[i] = (gint16) (in[i] * gain);
++      break;
++    }
++    case GST_AUDIO_FORMAT_S32LE:{
++      const gint32 *in = (const gint32 *) data;
++      gint32 *out = (gint32 *) self->scratch;
++
++      for (i = 0; i < length / 4; i++)
++        out[i] = (gint32) (in[i] * gain);
++      break;
++    }
++    case GST_AUDIO_FORMAT_S24LE:
++      for (i = 0; i + 2 < length; i += 3) {
++        gint32 v = (gint32) GST_READ_UINT24_LE (data + i);
++
++        v = (v ^ 0x800000) - 0x800000;  /* sign-extend */
++        v = (gint32) (v * gain);
++        GST_WRITE_UINT24_LE (self->scratch + i, (guint32) v & 0xffffff);
++      }
++      break;
++    default:
++      return data;
++  }
++
++  return self->scratch;
++}
++
 +/* Writes as much as it can until the ring buffer leaves the started state,
 + * starting the stream first if needed: GstAudioSink has no hook for the
 + * first start, only for resuming. Returns the bytes written, which is 0 once
@@ -483,9 +593,16 @@ index 0000000000..11fffcfc7e
 +gst_aaudio_sink_write (GstAudioSink * asink, gpointer data, guint length)
 +{
 +  GstAAudioSink *self = GST_AAUDIO_SINK (asink);
-+  guint8 *ptr = data;
++  const guint8 *ptr = data;
 +  gint32 frames = length / self->device_bpf;
 +  gint32 done = 0;
++  gdouble gain;
++
++  GST_OBJECT_LOCK (self);
++  gain = self->mute ? 0.0 : self->volume;
++  GST_OBJECT_UNLOCK (self);
++  if (gain < 1.0)
++    ptr = apply_gain (self, ptr, length, gain);
 +
 +  while (done < frames) {
 +    AAudioStream *stream;
@@ -632,6 +749,7 @@ index 0000000000..11fffcfc7e
 +  GstAAudioSink *self = GST_AAUDIO_SINK (object);
 +
 +  g_mutex_clear (&self->lock);
++  g_free (self->scratch);
 +
 +  G_OBJECT_CLASS (parent_class)->finalize (object);
 +}
@@ -661,6 +779,16 @@ index 0000000000..11fffcfc7e
 +          "Offer AC-3, E-AC-3 and DTS for IEC 61937 passthrough (API 34+)",
 +          DEFAULT_PASSTHROUGH, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 +
++  /* GstStreamVolume, as openslessink has. It does not apply to passthrough,
++   * where mute sends silence instead. */
++  g_object_class_install_property (gobject_class, PROP_VOLUME,
++      g_param_spec_double ("volume", "Volume", "Volume of this stream",
++          0.0, 1.0, DEFAULT_VOLUME,
++          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
++  g_object_class_install_property (gobject_class, PROP_MUTE,
++      g_param_spec_boolean ("mute", "Mute", "Mute state of this stream",
++          DEFAULT_MUTE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
++
 +  gst_element_class_add_static_pad_template (element_class, &sink_template);
 +  gst_element_class_set_static_metadata (element_class, "AAudio Sink",
 +      "Sink/Audio", "Output audio through AAudio",
@@ -689,6 +817,8 @@ index 0000000000..11fffcfc7e
 +{
 +  g_mutex_init (&self->lock);
 +  self->passthrough = DEFAULT_PASSTHROUGH;
++  self->volume = DEFAULT_VOLUME;
++  self->mute = DEFAULT_MUTE;
 +}
 +
 +static gboolean
@@ -1218,10 +1348,10 @@ index 0000000000..c22c09fd9a
 +#endif /* __GST_ANDROID_AUDIO_H__ */
 diff --git a/subprojects/gst-plugins-bad/sys/androidmedia/gstaudiotracksink.c b/subprojects/gst-plugins-bad/sys/androidmedia/gstaudiotracksink.c
 new file mode 100644
-index 0000000000..7165cda834
+index 0000000000..bf7b57202f
 --- /dev/null
 +++ b/subprojects/gst-plugins-bad/sys/androidmedia/gstaudiotracksink.c
-@@ -0,0 +1,1225 @@
+@@ -0,0 +1,1320 @@
 +/*
 + * Copyright (C) 2026 BuzzTV
 + *
@@ -1307,7 +1437,7 @@ index 0000000000..7165cda834
 +  jmethodID track_play, track_pause, track_flush, track_release;
 +  jmethodID track_write_buffer, track_write_shorts;
 +  jmethodID track_get_playback_head_position, track_get_timestamp;
-+  jmethodID track_get_state, track_get_min_buffer_size;
++  jmethodID track_get_state, track_get_min_buffer_size, track_set_volume;
 +  jmethodID track_is_direct_playback_supported;       /* API 29, may be NULL */
 +
 +  jmethodID track_builder_ctor, track_builder_set_audio_attributes;
@@ -1342,8 +1472,12 @@ index 0000000000..7165cda834
 +  /* with the object lock */
 +  gboolean passthrough;
 +  guint supported_passthrough;
++  gdouble volume;
++  gboolean mute;
 +
-+  /* The JNI thread and its queue of Jobs. */
++  /* The JNI thread and its queue of Jobs. worker_lock keeps a volume change
++   * from another thread off a queue that close() is tearing down. */
++  GMutex worker_lock;
 +  GThread *worker;
 +  GAsyncQueue *jobs;
 +  GMutex job_lock;
@@ -1354,6 +1488,8 @@ index 0000000000..7165cda834
 +  jobject timestamp;
 +  jshortArray shorts;
 +  gint shorts_len;
++  gshort *zeros;
++  gint zeros_len;
 +  gboolean playing;
 +  guint64 head_position;
 +  gint64 frames_written;
@@ -1380,9 +1516,13 @@ index 0000000000..7165cda834
 +{
 +  PROP_0,
 +  PROP_PASSTHROUGH,
++  PROP_VOLUME,
++  PROP_MUTE,
 +};
 +
 +#define DEFAULT_PASSTHROUGH FALSE
++#define DEFAULT_VOLUME 1.0
++#define DEFAULT_MUTE FALSE
 +
 +#define PCM_FORMATS "{ F32LE, S16LE, S32LE, S24LE }"
 +#define PCM_STRUCTURE(n, mask) \
@@ -1414,8 +1554,11 @@ index 0000000000..7165cda834
 +        "block-size = (int) { 512, 1024, 2048 }, "
 +        "rate = (int) { 32000, 44100, 48000 }"));
 +
++static void gst_audio_track_sink_volume_changed (GstAudioTrackSink * self);
++
 +#define gst_audio_track_sink_parent_class parent_class
-+G_DEFINE_TYPE (GstAudioTrackSink, gst_audio_track_sink, GST_TYPE_AUDIO_SINK);
++G_DEFINE_TYPE_WITH_CODE (GstAudioTrackSink, gst_audio_track_sink, GST_TYPE_AUDIO_SINK,
++    G_IMPLEMENT_INTERFACE (GST_TYPE_STREAM_VOLUME, NULL));
 +
 +static GstClockTime
 +monotonic_time (void)
@@ -1484,6 +1627,7 @@ index 0000000000..7165cda834
 +{
 +  GError *err = NULL;
 +
++  g_mutex_lock (&self->worker_lock);
 +  self->jobs = g_async_queue_new ();
 +  self->worker = g_thread_try_new ("audiotrack-jni", worker_func, self, &err);
 +  if (!self->worker) {
@@ -1491,22 +1635,23 @@ index 0000000000..7165cda834
 +        err->message);
 +    g_clear_error (&err);
 +    g_clear_pointer (&self->jobs, g_async_queue_unref);
-+    return FALSE;
 +  }
++  g_mutex_unlock (&self->worker_lock);
 +
-+  return TRUE;
++  return self->worker != NULL;
 +}
 +
 +static void
 +stop_worker (GstAudioTrackSink * self)
 +{
-+  if (!self->worker)
-+    return;
-+
-+  invoke (self, NULL, NULL);
-+  g_thread_join (self->worker);
-+  self->worker = NULL;
-+  g_clear_pointer (&self->jobs, g_async_queue_unref);
++  g_mutex_lock (&self->worker_lock);
++  if (self->worker) {
++    invoke (self, NULL, NULL);
++    g_thread_join (self->worker);
++    self->worker = NULL;
++    g_clear_pointer (&self->jobs, g_async_queue_unref);
++  }
++  g_mutex_unlock (&self->worker_lock);
 +}
 +
 +static gboolean
@@ -1544,6 +1689,7 @@ index 0000000000..7165cda834
 +  METHOD (track_get_timestamp, track, "getTimestamp",
 +      "(Landroid/media/AudioTimestamp;)Z");
 +  METHOD (track_get_state, track, "getState", "()I");
++  METHOD (track_set_volume, track, "setVolume", "(F)I");
 +  STATIC_METHOD (track_get_min_buffer_size, track, "getMinBufferSize",
 +      "(III)I");
 +
@@ -1814,6 +1960,27 @@ index 0000000000..7165cda834
 +  reset_position (self);
 +}
 +
++/* Mute is setVolume (0) for PCM. A passthrough track ignores the volume;
++ * job_write() sends silence for it instead. */
++static void
++job_apply_volume (GstAudioTrackSink * self, JNIEnv * env, gpointer data)
++{
++  gdouble gain;
++  gint ret = 0;
++
++  if (!self->track || self->iec61937)
++    return;
++
++  GST_OBJECT_LOCK (self);
++  gain = self->mute ? 0.0 : self->volume;
++  GST_OBJECT_UNLOCK (self);
++
++  /* A float in varargs is passed, and read by the VM, as a double. */
++  if (!gst_amc_jni_call_int_method (env, NULL, self->track,
++          jni.track_set_volume, &ret, (jdouble) gain) || ret != 0)
++    GST_WARNING_OBJECT (self, "AudioTrack.setVolume (%f): %d", gain, ret);
++}
++
 +static void
 +job_create (GstAudioTrackSink * self, JNIEnv * env, gpointer data)
 +{
@@ -1884,6 +2051,7 @@ index 0000000000..7165cda834
 +
 +  self->track = gst_amc_jni_object_make_global (env, track);
 +  track = NULL;
++  job_apply_volume (self, env, NULL);
 +
 +  GST_INFO_OBJECT (self, "created AudioTrack: encoding %d, rate %d, "
 +      "mask 0x%x, buffer %d bytes (min %d)", self->encoding, self->rate,
@@ -2009,6 +2177,7 @@ index 0000000000..7165cda834
 +  if (self->iec61937) {
 +    /* IEC 61937 is written as shorts, as mpv does. */
 +    gint n = job->length / 2;
++    gboolean muted;
 +
 +    if (n > self->shorts_len) {
 +      jshortArray array = (*env)->NewShortArray (env, n);
@@ -2024,8 +2193,17 @@ index 0000000000..7165cda834
 +      self->shorts_len = n;
 +    }
 +
++    GST_OBJECT_LOCK (self);
++    muted = self->mute;
++    GST_OBJECT_UNLOCK (self);
++    if (muted && n > self->zeros_len) {
++      g_free (self->zeros);
++      self->zeros = g_new0 (gshort, n);
++      self->zeros_len = n;
++    }
++
 +    (*env)->SetShortArrayRegion (env, self->shorts, 0, n,
-+        (const jshort *) job->data);
++        muted ? (const jshort *) self->zeros : (const jshort *) job->data);
 +    if (gst_amc_jni_call_int_method (env, &err, self->track,
 +            jni.track_write_shorts, &ret, self->shorts, 0, n,
 +            WRITE_NON_BLOCKING) && ret > 0)
@@ -2274,6 +2452,16 @@ index 0000000000..7165cda834
 +  invoke (self, job_stop, NULL);
 +}
 +
++/* From any thread; must not be called with the object lock held. */
++static void
++gst_audio_track_sink_volume_changed (GstAudioTrackSink * self)
++{
++  g_mutex_lock (&self->worker_lock);
++  if (self->worker)
++    invoke (self, job_apply_volume, NULL);
++  g_mutex_unlock (&self->worker_lock);
++}
++
 +/* GstBaseSink */
 +
 +static GstCaps *
@@ -2340,6 +2528,18 @@ index 0000000000..7165cda834
 +      self->passthrough = g_value_get_boolean (value);
 +      GST_OBJECT_UNLOCK (self);
 +      break;
++    case PROP_VOLUME:
++      GST_OBJECT_LOCK (self);
++      self->volume = g_value_get_double (value);
++      GST_OBJECT_UNLOCK (self);
++      gst_audio_track_sink_volume_changed (self);
++      break;
++    case PROP_MUTE:
++      GST_OBJECT_LOCK (self);
++      self->mute = g_value_get_boolean (value);
++      GST_OBJECT_UNLOCK (self);
++      gst_audio_track_sink_volume_changed (self);
++      break;
 +    default:
 +      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
 +      break;
@@ -2358,6 +2558,16 @@ index 0000000000..7165cda834
 +      g_value_set_boolean (value, self->passthrough);
 +      GST_OBJECT_UNLOCK (self);
 +      break;
++    case PROP_VOLUME:
++      GST_OBJECT_LOCK (self);
++      g_value_set_double (value, self->volume);
++      GST_OBJECT_UNLOCK (self);
++      break;
++    case PROP_MUTE:
++      GST_OBJECT_LOCK (self);
++      g_value_set_boolean (value, self->mute);
++      GST_OBJECT_UNLOCK (self);
++      break;
 +    default:
 +      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
 +      break;
@@ -2369,9 +2579,11 @@ index 0000000000..7165cda834
 +{
 +  GstAudioTrackSink *self = GST_AUDIO_TRACK_SINK (object);
 +
++  g_mutex_clear (&self->worker_lock);
 +  g_mutex_clear (&self->job_lock);
 +  g_cond_clear (&self->job_cond);
 +  g_mutex_clear (&self->lock);
++  g_free (self->zeros);
 +
 +  G_OBJECT_CLASS (parent_class)->finalize (object);
 +}
@@ -2401,6 +2613,16 @@ index 0000000000..7165cda834
 +          "Offer AC-3, E-AC-3 and DTS for IEC 61937 passthrough",
 +          DEFAULT_PASSTHROUGH, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 +
++  /* GstStreamVolume, as openslessink has. It does not apply to passthrough,
++   * where mute sends silence instead. */
++  g_object_class_install_property (gobject_class, PROP_VOLUME,
++      g_param_spec_double ("volume", "Volume", "Volume of this stream",
++          0.0, 1.0, DEFAULT_VOLUME,
++          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
++  g_object_class_install_property (gobject_class, PROP_MUTE,
++      g_param_spec_boolean ("mute", "Mute", "Mute state of this stream",
++          DEFAULT_MUTE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
++
 +  gst_element_class_add_static_pad_template (element_class, &sink_template);
 +  gst_element_class_set_static_metadata (element_class, "AudioTrack Sink",
 +      "Sink/Audio", "Output audio through android.media.AudioTrack",
@@ -2428,10 +2650,13 @@ index 0000000000..7165cda834
 +static void
 +gst_audio_track_sink_init (GstAudioTrackSink * self)
 +{
++  g_mutex_init (&self->worker_lock);
 +  g_mutex_init (&self->job_lock);
 +  g_cond_init (&self->job_cond);
 +  g_mutex_init (&self->lock);
 +  self->passthrough = DEFAULT_PASSTHROUGH;
++  self->volume = DEFAULT_VOLUME;
++  self->mute = DEFAULT_MUTE;
 +}
 +
 +gboolean
