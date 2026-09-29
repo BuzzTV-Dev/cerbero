@@ -1,0 +1,7 @@
+# Elements that exist only because of a patch under recipes/gstreamer-1.0/, as
+# "<plugin> <element>". CI checks that each element's name is in its plugin's
+# archive, so a patch that stops applying -- or is silently dropped by a
+# re-extracted source tree -- fails the build here instead of at the app's
+# ElementFactory::make at runtime.
+androidmedia aaudiosink
+androidmedia audiotracksink

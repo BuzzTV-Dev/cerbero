@@ -213,6 +213,114 @@ which is what shipped the library.
 The subset of the SDK the app's plugin list resolves to, rather than every
 sub-package. The package file lists the categories and what each contributes.
 
+### 7. `recipes/gstreamer-1.0/0002-androidmedia-*.patch`: multichannel audio sinks
+
+`openslessink` takes S16LE/U8 stereo at most, so GStreamer on Android can't
+output 5.1/7.1 PCM or compressed passthrough. The patch adds two elements to
+the `androidmedia` plugin (which the app already links, so there's no new
+`GSTREAMER_PLUGINS` entry). Upstream has no equivalent: as of 2026-09 there's no
+AAudio or AudioTrack sink in gst-plugins-bad `main`, and no merge request or
+issue for one. The patch goes in through the `buzztv-1.28` branch, like the
+baseparse one in section 3.
+
+Both sinks are registered at `GST_RANK_NONE`, so `autoaudiosink` and playbin's
+default still pick `openslessink`. Create them by name.
+
+| | `aaudiosink` | `audiotracksink` |
+| --- | --- | --- |
+| API | NDK AAudio, `libaaudio.so` loaded at runtime | `android.media.AudioTrack` over JNI |
+| registered from | API 26 (the element doesn't exist when libaaudio is missing) | API 23 (`AudioTrack.Builder`) |
+| PCM formats | F32LE, S16LE; plus S32LE, S24LE (packed) from API 31 | same |
+| PCM channels | 1-2; 1-8 from API 32 (`AAudioStreamBuilder_setChannelMask`) | 1-8 |
+| PCM rates | 8000-192000, resampled by the framework | same |
+| IEC 61937 | API 34+ (`AAUDIO_FORMAT_IEC61937`), only with `passthrough=true` | API 24+ (`ENCODING_IEC61937`), only with `passthrough=true` |
+
+**Channel layouts**, as GStreamer `channel-mask` → Android mask. These are the
+layouts ExoPlayer's and mpv's AudioTrack outputs open:
+
+| channels | `channel-mask` | Android |
+| --- | --- | --- |
+| 1 | none | `CHANNEL_OUT_MONO` |
+| 2 | `0x3` | `STEREO` |
+| 3 | `0x7` | `STEREO \| FRONT_CENTER` |
+| 4 | `0x33` (rear), `0xc03` (side) | `QUAD` |
+| 5 | `0x37` (rear), `0xc07` (side) | `QUAD \| FRONT_CENTER` |
+| 6 | `0x3f` (5.1 rear), `0xc0f` (5.1 side) | `5POINT1` |
+| 7 | `0x13f` | `5POINT1 \| BACK_CENTER` |
+| 8 | `0xc3f` | `7POINT1_SURROUND` |
+
+The side-surround variants map onto the back-surround Android layout with the
+same channel count. AC-3 and AAC decoders emit either one, the two channels sit
+in the same slots, and Android's "5.1" means back surround anyway. No layout in
+the table needs reordering. Anything else is converted by an `audioconvert`
+upstream of the sink.
+
+**Passthrough** (`passthrough` property, default `false`). The sink payloads
+the input as IEC 61937 with `gst_audio_iec61937_payload()` and plays it as
+2-channel 16-bit:
+
+| caps | IEC 61937 rate |
+| --- | --- |
+| `audio/x-ac3, framed=true`, 32/44.1/48 kHz | codec rate |
+| `audio/x-eac3, framed=true, alignment=frame`, 32/44.1/48 kHz | 4 × codec rate (192 kHz for 48 kHz E-AC-3) |
+| `audio/x-dts, framed=true, block-size={512,1024,2048}`, 32/44.1/48 kHz | codec rate |
+
+The caps need a parser (`ac3parse`, `dcaparse`) in front of the sink. That's
+also what makes decodebin/playbin skip the decoder once the sink advertises
+them. TrueHD and DTS-HD aren't offered because GStreamer's payloader can't pack
+them. E-AC-3 has to be frame-aligned: upstream's payloader refuses
+`alignment=iec61937` (a check that has been inverted since it was written). So
+E-AC-3 frames with fewer than six audio blocks aren't packed the way the
+standard wants; broadcast E-AC-3 uses six. The IEC 61937 rate is never clamped
+to the mixer's native rate. That clamp is what kept mpv from passing E-AC-3
+through on the p6 (libmpv-android-video-build PR #5).
+
+Which passthrough codecs each sink offers:
+
+* `audiotracksink`, API 29+: the ones `AudioTrack.isDirectPlaybackSupported()`
+  reports for the current output, probed at NULL→READY. That reflects what the
+  HDMI sink (the AV receiver's EDID) accepts. It asks about `ENCODING_AC3` /
+  `E_AC3` / `DTS` and then sends IEC 61937 regardless, as mpv does on these
+  boxes.
+* `audiotracksink`, API 24-28: all three. A track the output can't take fails
+  to open, and the pipeline errors out.
+* `aaudiosink`, API 34+: all three. AAudio has no capability query, so set
+  `passthrough` only when the output is known to take them.
+
+On API 32-33 (the p6 is 33) passthrough is `audiotracksink` only.
+
+**Threads.** `audiotracksink` makes every JNI call on one thread it owns
+(`audiotrack-jni`); the state-change, streaming and ring buffer threads only
+queue work to it. This matters because attaching a thread the app created, such
+as a tokio worker, to the VM has wedged MediaCodec in this app before. The
+JavaVM comes from androidmedia's existing `gst_amc_jni_*` plumbing, i.e. the
+app's `gst_android_get_java_vm` hook; there's no new JNI setup. Both sinks
+write without blocking (AAudio with a 10 ms timeout, AudioTrack with
+`WRITE_NON_BLOCKING`) and check the ring buffer state on every pass, so a pause
+or flush never waits on a full device buffer. Both reopen the stream or track
+when the output goes away (`AAUDIO_ERROR_DISCONNECTED`, `ERROR_DEAD_OBJECT`),
+e.g. on HDMI replug.
+
+`ci/buzztv/required-elements.txt` makes CI refuse to publish a tarball whose
+`libgstandroidmedia.a` lacks either element, so a patch that stops applying
+fails the build rather than the app.
+
+**Switching the app** (iptv-flutter, a follow-up there): `create_audio_sink()`
+in `coreapi/features/gstreamer_player/src/pipelines.rs` makes
+`audiotracksink`, or `aaudiosink` for PCM only, instead of `openslessink`. Keep
+`qos=true`, and keep an `audioconvert` in front of it. `channel_mix_filter`'s
+stereo downmix (BuzzTV-Dev/BuzzTV#203) can then pass 5.1/7.1 through when the
+Audio Output setting asks for them. `Android.mk` needs no change. Before
+blaming a sink for stereo output, check whether the HDMI profile advertises
+multichannel at all:
+
+```sh
+adb shell dumpsys media.audio_policy | grep -A30 -i hdmi   # the output's channel masks and encodings
+adb shell dumpsys media.audio_flinger | grep -iE 'channel (count|mask)|format'   # what the track actually got
+```
+
+If the profile is stereo only, Android downmixes whatever the sink sends.
+
 ## What the trimming is worth
 
 Measured on this branch, both ABIs in one tarball:

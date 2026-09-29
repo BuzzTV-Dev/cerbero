@@ -21,6 +21,7 @@ OUTPUT_DIR="$1"; shift
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PLUGINS_FILE="${HERE}/required-plugins.txt"
+ELEMENTS_FILE="${HERE}/required-elements.txt"
 STAGE="$(mktemp -d)"
 trap 'rm -rf "${STAGE}"' EXIT
 
@@ -71,6 +72,16 @@ for abi in ${ABIS}; do
             status=1
         fi
     done < "${PLUGINS_FILE}"
+    # No toolchain here to read the symbol table, but an element's name is a
+    # string literal in its plugin's archive: absent means not registered.
+    while read -r plugin element; do
+        case "${plugin}" in ''|\#*) continue ;; esac
+        archive="${STAGE}/${abi}/lib/gstreamer-1.0/libgst${plugin}.a"
+        if [ ! -f "${archive}" ] || ! grep -qaF "${element}" "${archive}"; then
+            echo "ERROR: ${abi} ${plugin} has no ${element} element" >&2
+            status=1
+        fi
+    done < "${ELEMENTS_FILE}"
     count=$(find "${STAGE}/${abi}/lib/gstreamer-1.0" -maxdepth 1 -name '*.a' 2>/dev/null | wc -l)
     echo "${abi}: ${count} plugins"
 done
