@@ -1,4 +1,4 @@
-From b42c14be6b2939cee7efa24caebf053bde91f1af Mon Sep 17 00:00:00 2001
+From 25ea46a4f2ea2f5d45e660bfbe76fe67ff6bfb54 Mon Sep 17 00:00:00 2001
 From: Maksym Vasylchuk <max@buzztv.com>
 Date: Tue, 29 Sep 2026 19:19:51 +0300
 Subject: [PATCH] androidmedia: Add aaudiosink and audiotracksink
@@ -13,15 +13,15 @@ audiotracksink makes every JNI call on one thread it owns.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- .../sys/androidmedia/gstaaudiosink.c          |  736 ++++++++++
+ .../sys/androidmedia/gstaaudiosink.c          |  739 ++++++++++
  .../sys/androidmedia/gstaaudiosink.h          |   36 +
  .../gst-plugins-bad/sys/androidmedia/gstamc.c |   10 +
- .../sys/androidmedia/gstandroidaudio.c        |  286 ++++
+ .../sys/androidmedia/gstandroidaudio.c        |  290 ++++
  .../sys/androidmedia/gstandroidaudio.h        |   68 +
- .../sys/androidmedia/gstaudiotracksink.c      | 1222 +++++++++++++++++
+ .../sys/androidmedia/gstaudiotracksink.c      | 1225 +++++++++++++++++
  .../sys/androidmedia/gstaudiotracksink.h      |   36 +
  .../sys/androidmedia/meson.build              |    6 +
- 8 files changed, 2400 insertions(+)
+ 8 files changed, 2410 insertions(+)
  create mode 100644 subprojects/gst-plugins-bad/sys/androidmedia/gstaaudiosink.c
  create mode 100644 subprojects/gst-plugins-bad/sys/androidmedia/gstaaudiosink.h
  create mode 100644 subprojects/gst-plugins-bad/sys/androidmedia/gstandroidaudio.c
@@ -31,10 +31,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 
 diff --git a/subprojects/gst-plugins-bad/sys/androidmedia/gstaaudiosink.c b/subprojects/gst-plugins-bad/sys/androidmedia/gstaaudiosink.c
 new file mode 100644
-index 0000000000..13fa2c9ad7
+index 0000000000..11fffcfc7e
 --- /dev/null
 +++ b/subprojects/gst-plugins-bad/sys/androidmedia/gstaaudiosink.c
-@@ -0,0 +1,736 @@
+@@ -0,0 +1,739 @@
 +/*
 + * Copyright (C) 2026 BuzzTV
 + *
@@ -679,6 +679,9 @@ index 0000000000..13fa2c9ad7
 +  audiosink_class->delay = GST_DEBUG_FUNCPTR (gst_aaudio_sink_delay);
 +  audiosink_class->pause = GST_DEBUG_FUNCPTR (gst_aaudio_sink_pause);
 +  audiosink_class->stop = GST_DEBUG_FUNCPTR (gst_aaudio_sink_stop);
++  /* A flushing seek: drop what the device still holds, or it plays after
++   * the seek. */
++  audiosink_class->extension->clear_all = GST_DEBUG_FUNCPTR (gst_aaudio_sink_stop);
 +}
 +
 +static void
@@ -845,10 +848,10 @@ index 6f00c708fa..d38f1b1191 100644
  
 diff --git a/subprojects/gst-plugins-bad/sys/androidmedia/gstandroidaudio.c b/subprojects/gst-plugins-bad/sys/androidmedia/gstandroidaudio.c
 new file mode 100644
-index 0000000000..134c5167bd
+index 0000000000..0613cd5484
 --- /dev/null
 +++ b/subprojects/gst-plugins-bad/sys/androidmedia/gstandroidaudio.c
-@@ -0,0 +1,286 @@
+@@ -0,0 +1,290 @@
 +/*
 + * Copyright (C) 2026 BuzzTV
 + *
@@ -1100,7 +1103,11 @@ index 0000000000..134c5167bd
 +  return ret;
 +}
 +
-+/* Android takes IEC 61937 as native-endian 16-bit words. */
++/* Android takes IEC 61937 as native-endian 16-bit words. The payloader
++ * always writes its header that way on a little-endian host, and swaps the
++ * payload only when told the output is big-endian -- which is what makes the
++ * byte-stream AC-3 sync word 0B 77 read as the word 0x0B77, like pulsesink
++ * and alsasink do. */
 +GstBuffer *
 +gst_android_audio_payload (GstAudioBaseSink * sink, GstBuffer * buf)
 +{
@@ -1122,7 +1129,7 @@ index 0000000000..134c5167bd
 +  gst_buffer_map (out, &oinfo, GST_MAP_WRITE);
 +
 +  if (!gst_audio_iec61937_payload (iinfo.data, iinfo.size,
-+          oinfo.data, oinfo.size, spec, G_BYTE_ORDER)) {
++          oinfo.data, oinfo.size, spec, G_BIG_ENDIAN)) {
 +    gst_buffer_unmap (buf, &iinfo);
 +    gst_buffer_unmap (out, &oinfo);
 +    gst_buffer_unref (out);
@@ -1211,10 +1218,10 @@ index 0000000000..c22c09fd9a
 +#endif /* __GST_ANDROID_AUDIO_H__ */
 diff --git a/subprojects/gst-plugins-bad/sys/androidmedia/gstaudiotracksink.c b/subprojects/gst-plugins-bad/sys/androidmedia/gstaudiotracksink.c
 new file mode 100644
-index 0000000000..67a41acebe
+index 0000000000..7165cda834
 --- /dev/null
 +++ b/subprojects/gst-plugins-bad/sys/androidmedia/gstaudiotracksink.c
-@@ -0,0 +1,1222 @@
+@@ -0,0 +1,1225 @@
 +/*
 + * Copyright (C) 2026 BuzzTV
 + *
@@ -2413,6 +2420,9 @@ index 0000000000..67a41acebe
 +  audiosink_class->delay = GST_DEBUG_FUNCPTR (gst_audio_track_sink_delay);
 +  audiosink_class->pause = GST_DEBUG_FUNCPTR (gst_audio_track_sink_pause);
 +  audiosink_class->stop = GST_DEBUG_FUNCPTR (gst_audio_track_sink_stop);
++  /* A flushing seek: drop what the device still holds, or it plays after
++   * the seek. */
++  audiosink_class->extension->clear_all = GST_DEBUG_FUNCPTR (gst_audio_track_sink_stop);
 +}
 +
 +static void
