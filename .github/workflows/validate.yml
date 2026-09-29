@@ -123,6 +123,10 @@ jobs:
             grep -v '^#' ci/buzztv/required-plugins.txt | grep -v '^$' | while read -r p; do
               touch "$work/$abi/lib/gstreamer-1.0/libgst$p.a" "$work/$abi/lib/gstreamer-1.0/libgst$p.la"
             done
+            # The element check looks for each name inside its plugin's archive.
+            grep -v '^#' ci/buzztv/required-elements.txt | grep -v '^$' | while read -r p e; do
+              echo "$e" >> "$work/$abi/lib/gstreamer-1.0/libgst$p.a"
+            done
             tar -cf "$work/$abi.tar" -C "$work/$abi" .
           done
 
@@ -136,5 +140,15 @@ jobs:
           tar -cf "$work/armv7.tar" -C "$work/armv7" .
           if ./ci/buzztv/assemble-universal.sh 0.0.0 "$work/out2" "arm64:$work/arm64.tar" "armv7:$work/armv7.tar"; then
             echo "ERROR: assemble-universal.sh published a tree with a missing .la" >&2
+            exit 1
+          fi
+
+          # .la restored, but androidmedia without the patched-in elements: the
+          # symptom of a recipes/gstreamer-1.0 patch that stopped applying.
+          touch "$work/armv7/lib/gstreamer-1.0/libgstcoreelements.la"
+          : > "$work/armv7/lib/gstreamer-1.0/libgstandroidmedia.a"
+          tar -cf "$work/armv7.tar" -C "$work/armv7" .
+          if ./ci/buzztv/assemble-universal.sh 0.0.0 "$work/out3" "arm64:$work/arm64.tar" "armv7:$work/armv7.tar"; then
+            echo "ERROR: assemble-universal.sh published a tree without the patched elements" >&2
             exit 1
           fi
