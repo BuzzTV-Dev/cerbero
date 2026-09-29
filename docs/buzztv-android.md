@@ -226,6 +226,14 @@ baseparse one in section 3.
 Both sinks are registered at `GST_RANK_NONE`, so `autoaudiosink` and playbin's
 default still pick `openslessink`. Create them by name.
 
+Like `openslessink`, both implement `GstStreamVolume`: `volume` (0.0-1.0) and
+`mute`. The app looks its volume control up by that interface, and muting the
+unfocused Multi Screen tiles depends on it. `audiotracksink` applies it with
+`AudioTrack.setVolume()`. AAudio has no volume control, so `aaudiosink` scales
+the PCM itself, and a change reaches the output after what the device has
+already buffered. A bitstream can't be scaled, so on passthrough `volume` has
+no effect and `mute` sends silence.
+
 | | `aaudiosink` | `audiotracksink` |
 | --- | --- | --- |
 | API | NDK AAudio, `libaaudio.so` loaded at runtime | `android.media.AudioTrack` over JNI |
