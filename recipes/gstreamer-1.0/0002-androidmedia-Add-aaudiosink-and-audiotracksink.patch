@@ -1,0 +1,2520 @@
+From b42c14be6b2939cee7efa24caebf053bde91f1af Mon Sep 17 00:00:00 2001
+From: Maksym Vasylchuk <max@buzztv.com>
+Date: Tue, 29 Sep 2026 19:19:51 +0300
+Subject: [PATCH] androidmedia: Add aaudiosink and audiotracksink
+
+openslessink tops out at stereo S16. aaudiosink plays PCM up to 7.1
+through AAudio (channel masks need API 32) and IEC 61937 from API 34.
+audiotracksink plays the same PCM through AudioTrack, plus AC-3, E-AC-3
+and DTS as IEC 61937 from API 24, offering only what
+isDirectPlaybackSupported() reports from API 29 on.
+
+audiotracksink makes every JNI call on one thread it owns.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../sys/androidmedia/gstaaudiosink.c          |  736 ++++++++++
+ .../sys/androidmedia/gstaaudiosink.h          |   36 +
+ .../gst-plugins-bad/sys/androidmedia/gstamc.c |   10 +
+ .../sys/androidmedia/gstandroidaudio.c        |  286 ++++
+ .../sys/androidmedia/gstandroidaudio.h        |   68 +
+ .../sys/androidmedia/gstaudiotracksink.c      | 1222 +++++++++++++++++
+ .../sys/androidmedia/gstaudiotracksink.h      |   36 +
+ .../sys/androidmedia/meson.build              |    6 +
+ 8 files changed, 2400 insertions(+)
+ create mode 100644 subprojects/gst-plugins-bad/sys/androidmedia/gstaaudiosink.c
+ create mode 100644 subprojects/gst-plugins-bad/sys/androidmedia/gstaaudiosink.h
+ create mode 100644 subprojects/gst-plugins-bad/sys/androidmedia/gstandroidaudio.c
+ create mode 100644 subprojects/gst-plugins-bad/sys/androidmedia/gstandroidaudio.h
+ create mode 100644 subprojects/gst-plugins-bad/sys/androidmedia/gstaudiotracksink.c
+ create mode 100644 subprojects/gst-plugins-bad/sys/androidmedia/gstaudiotracksink.h
+
+diff --git a/subprojects/gst-plugins-bad/sys/androidmedia/gstaaudiosink.c b/subprojects/gst-plugins-bad/sys/androidmedia/gstaaudiosink.c
+new file mode 100644
+index 0000000000..13fa2c9ad7
+--- /dev/null
++++ b/subprojects/gst-plugins-bad/sys/androidmedia/gstaaudiosink.c
+@@ -0,0 +1,736 @@
++/*
++ * Copyright (C) 2026 BuzzTV
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Library General Public
++ * License as published by the Free Software Foundation; either
++ * version 2 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Library General Public License for more details.
++ *
++ * You should have received a copy of the GNU Library General Public
++ * License along with this library; if not, write to the
++ * Free Software Foundation, Inc., 51 Franklin St, Fifth Floor,
++ * Boston, MA 02110-1301, USA.
++ */
++
++/**
++ * SECTION:element-aaudiosink
++ * @title: aaudiosink
++ *
++ * Audio sink on the NDK AAudio API.
++ *
++ * Plays PCM in the layouts Android opens (mono to 7.1, see the pad
++ * template), which needs API 32 (AAudioStreamBuilder_setChannelMask) for
++ * more than two channels; below that only mono and stereo are offered.
++ * With #GstAAudioSink:passthrough set, on API 34 and newer it also takes
++ * parsed AC-3, E-AC-3 and DTS and sends them as IEC 61937
++ * (AAUDIO_FORMAT_IEC61937) for an external decoder. For passthrough below
++ * API 34, use audiotracksink.
++ *
++ * libaaudio is loaded at runtime, so the plugin still loads on devices
++ * without it; the element is simply not registered there.
++ *
++ * ## Example pipeline
++ * |[
++ * gst-launch-1.0 audiotestsrc ! audioconvert ! audio/x-raw,channels=6 ! aaudiosink
++ * ]|
++ */
++
++#ifdef HAVE_CONFIG_H
++#include "config.h"
++#endif
++
++#include <string.h>
++#include <time.h>
++#include <aaudio/AAudio.h>
++#include <gmodule.h>
++
++#include "gstaaudiosink.h"
++#include "gstandroidaudio.h"
++
++GST_DEBUG_CATEGORY_STATIC (aaudio_sink_debug);
++#define GST_CAT_DEFAULT aaudio_sink_debug
++
++/* How long one AAudioStream_write() may wait for room, so that a pause or a
++ * stop is noticed promptly even while the stream is full. */
++#define WRITE_TIMEOUT_NS (10 * GST_MSECOND)
++#define STATE_CHANGE_TIMEOUT_NS (100 * GST_MSECOND)
++
++/* The AAudio entry points, looked up at runtime: the build targets an API
++ * level below AAudio's, and the API 28, 32 and 34 additions are checked for
++ * individually. The optional ones are NULL where the device lacks them. */
++static struct
++{
++  aaudio_result_t (*createStreamBuilder) (AAudioStreamBuilder ** builder);
++  void (*builder_setDirection) (AAudioStreamBuilder * builder,
++      aaudio_direction_t direction);
++  void (*builder_setSharingMode) (AAudioStreamBuilder * builder,
++      aaudio_sharing_mode_t mode);
++  void (*builder_setPerformanceMode) (AAudioStreamBuilder * builder,
++      aaudio_performance_mode_t mode);
++  void (*builder_setFormat) (AAudioStreamBuilder * builder,
++      aaudio_format_t format);
++  void (*builder_setSampleRate) (AAudioStreamBuilder * builder,
++      int32_t rate);
++  void (*builder_setChannelCount) (AAudioStreamBuilder * builder,
++      int32_t channels);
++  void (*builder_setBufferCapacityInFrames) (AAudioStreamBuilder * builder,
++      int32_t frames);
++  void (*builder_setUsage) (AAudioStreamBuilder * builder,
++      aaudio_usage_t usage);
++  void (*builder_setContentType) (AAudioStreamBuilder * builder,
++      aaudio_content_type_t type);
++  void (*builder_setChannelMask) (AAudioStreamBuilder * builder,
++      aaudio_channel_mask_t mask);
++  aaudio_result_t (*builder_openStream) (AAudioStreamBuilder * builder,
++      AAudioStream ** stream);
++  aaudio_result_t (*builder_delete) (AAudioStreamBuilder * builder);
++
++  aaudio_result_t (*stream_close) (AAudioStream * stream);
++  aaudio_result_t (*stream_requestStart) (AAudioStream * stream);
++  aaudio_result_t (*stream_requestPause) (AAudioStream * stream);
++  aaudio_result_t (*stream_requestFlush) (AAudioStream * stream);
++  aaudio_result_t (*stream_waitForStateChange) (AAudioStream * stream,
++      aaudio_stream_state_t input, aaudio_stream_state_t * next,
++      int64_t timeout_ns);
++  aaudio_result_t (*stream_write) (AAudioStream * stream, const void *buffer,
++      int32_t frames, int64_t timeout_ns);
++  aaudio_result_t (*stream_getTimestamp) (AAudioStream * stream,
++      clockid_t clockid, int64_t * frame_position, int64_t * time_ns);
++  int64_t (*stream_getFramesWritten) (AAudioStream * stream);
++  int64_t (*stream_getFramesRead) (AAudioStream * stream);
++  aaudio_stream_state_t (*stream_getState) (AAudioStream * stream);
++  int32_t (*stream_getSampleRate) (AAudioStream * stream);
++  int32_t (*stream_getChannelCount) (AAudioStream * stream);
++  aaudio_format_t (*stream_getFormat) (AAudioStream * stream);
++  int32_t (*stream_getBufferCapacityInFrames) (AAudioStream * stream);
++
++  const char *(*convertResultToText) (aaudio_result_t result);
++} aaudio;
++
++struct _GstAAudioSink
++{
++  GstAudioSink parent;
++
++  gboolean passthrough;
++
++  /* Protects everything below: delay() and pause()/stop() come from other
++   * threads than the writer. */
++  GMutex lock;
++  AAudioStream *stream;
++  gboolean started;
++
++  /* What prepare() asked for, kept to reopen the stream after a
++   * disconnect. */
++  aaudio_format_t format;
++  gint rate;
++  gint channels;
++  aaudio_channel_mask_t channel_mask;
++  gint capacity_frames;
++  /* Bytes per AAudio frame, and per ring buffer frame. They differ only for
++   * E-AC-3, where one ring buffer frame is four IEC 61937 frames. */
++  gint device_bpf;
++  gint ring_bpf;
++};
++
++enum
++{
++  PROP_0,
++  PROP_PASSTHROUGH,
++};
++
++#define DEFAULT_PASSTHROUGH FALSE
++
++#define PCM_FORMATS "{ F32LE, S16LE, S32LE, S24LE }"
++#define PCM_STRUCTURE(n, mask) \
++  "audio/x-raw, format = (string) " PCM_FORMATS ", " \
++  "layout = (string) interleaved, rate = (int) [ 8000, 192000 ], " \
++  "channels = (int) " G_STRINGIFY (n) ", channel-mask = (bitmask) " mask "; "
++
++static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE ("sink",
++    GST_PAD_SINK,
++    GST_PAD_ALWAYS,
++    GST_STATIC_CAPS ("audio/x-raw, format = (string) " PCM_FORMATS ", "
++        "layout = (string) interleaved, rate = (int) [ 8000, 192000 ], "
++        "channels = (int) 1; "
++        PCM_STRUCTURE (2, "0x3")
++        PCM_STRUCTURE (3, "0x7")
++        PCM_STRUCTURE (4, "0x33")
++        PCM_STRUCTURE (4, "0xc03")
++        PCM_STRUCTURE (5, "0x37")
++        PCM_STRUCTURE (5, "0xc07")
++        PCM_STRUCTURE (6, "0x3f")
++        PCM_STRUCTURE (6, "0xc0f")
++        PCM_STRUCTURE (7, "0x13f")
++        PCM_STRUCTURE (8, "0xc3f")
++        "audio/x-ac3, framed = (boolean) true, "
++        "rate = (int) { 32000, 44100, 48000 }; "
++        "audio/x-eac3, framed = (boolean) true, alignment = (string) frame, "
++        "rate = (int) { 32000, 44100, 48000 }; "
++        "audio/x-dts, framed = (boolean) true, "
++        "block-size = (int) { 512, 1024, 2048 }, "
++        "rate = (int) { 32000, 44100, 48000 }"));
++
++#define gst_aaudio_sink_parent_class parent_class
++G_DEFINE_TYPE (GstAAudioSink, gst_aaudio_sink, GST_TYPE_AUDIO_SINK);
++
++static const gchar *
++result_text (aaudio_result_t result)
++{
++  return aaudio.convertResultToText ? aaudio.convertResultToText (result) :
++      "unknown";
++}
++
++static void
++gst_aaudio_sink_set_property (GObject * object, guint prop_id,
++    const GValue * value, GParamSpec * pspec)
++{
++  GstAAudioSink *self = GST_AAUDIO_SINK (object);
++
++  switch (prop_id) {
++    case PROP_PASSTHROUGH:
++      GST_OBJECT_LOCK (self);
++      self->passthrough = g_value_get_boolean (value);
++      GST_OBJECT_UNLOCK (self);
++      break;
++    default:
++      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
++      break;
++  }
++}
++
++static void
++gst_aaudio_sink_get_property (GObject * object, guint prop_id,
++    GValue * value, GParamSpec * pspec)
++{
++  GstAAudioSink *self = GST_AAUDIO_SINK (object);
++
++  switch (prop_id) {
++    case PROP_PASSTHROUGH:
++      GST_OBJECT_LOCK (self);
++      g_value_set_boolean (value, self->passthrough);
++      GST_OBJECT_UNLOCK (self);
++      break;
++    default:
++      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
++      break;
++  }
++}
++
++static GstCaps *
++gst_aaudio_sink_getcaps (GstBaseSink * bsink, GstCaps * filter)
++{
++  GstAAudioSink *self = GST_AAUDIO_SINK (bsink);
++  static const gchar *formats_31[] = { "F32LE", "S16LE", "S32LE", "S24LE",
++    NULL
++  };
++  static const gchar *formats_26[] = { "F32LE", "S16LE", NULL };
++  gint api = gst_android_audio_get_api_level ();
++  gboolean passthrough;
++  GstCaps *caps, *tmp;
++
++  GST_OBJECT_LOCK (self);
++  passthrough = self->passthrough;
++  GST_OBJECT_UNLOCK (self);
++
++  caps = gst_android_audio_pcm_caps (api >= 31 ? formats_31 : formats_26,
++      aaudio.builder_setChannelMask ? 8 : 2);
++
++  if (passthrough && api >= 34)
++    gst_caps_append (caps,
++        gst_android_audio_passthrough_caps (GST_ANDROID_AUDIO_PASSTHROUGH_ALL));
++
++  if (filter) {
++    tmp = gst_caps_intersect_full (filter, caps, GST_CAPS_INTERSECT_FIRST);
++    gst_caps_unref (caps);
++    caps = tmp;
++  }
++
++  GST_LOG_OBJECT (self, "caps %" GST_PTR_FORMAT, caps);
++
++  return caps;
++}
++
++static gboolean
++gst_aaudio_sink_query (GstBaseSink * bsink, GstQuery * query)
++{
++  if (GST_QUERY_TYPE (query) == GST_QUERY_ACCEPT_CAPS) {
++    GstCaps *caps;
++
++    gst_query_parse_accept_caps (query, &caps);
++    gst_query_set_accept_caps_result (query,
++        gst_android_audio_accept_caps (GST_AUDIO_BASE_SINK (bsink), caps));
++    return TRUE;
++  }
++
++  return GST_BASE_SINK_CLASS (parent_class)->query (bsink, query);
++}
++
++static gboolean
++gst_aaudio_sink_open (GstAudioSink * asink)
++{
++  return TRUE;
++}
++
++static gboolean
++gst_aaudio_sink_close (GstAudioSink * asink)
++{
++  return TRUE;
++}
++
++/* With the lock. */
++static void
++close_stream (GstAAudioSink * self)
++{
++  if (self->stream) {
++    aaudio.stream_close (self->stream);
++    self->stream = NULL;
++  }
++  self->started = FALSE;
++}
++
++/* With the lock. */
++static gboolean
++open_stream (GstAAudioSink * self)
++{
++  AAudioStreamBuilder *builder = NULL;
++  AAudioStream *stream = NULL;
++  aaudio_result_t res;
++
++  res = aaudio.createStreamBuilder (&builder);
++  if (res != AAUDIO_OK) {
++    GST_ERROR_OBJECT (self, "AAudio_createStreamBuilder: %s",
++        result_text (res));
++    return FALSE;
++  }
++
++  aaudio.builder_setDirection (builder, AAUDIO_DIRECTION_OUTPUT);
++  aaudio.builder_setSharingMode (builder, AAUDIO_SHARING_MODE_SHARED);
++  aaudio.builder_setPerformanceMode (builder, AAUDIO_PERFORMANCE_MODE_NONE);
++  aaudio.builder_setFormat (builder, self->format);
++  aaudio.builder_setSampleRate (builder, self->rate);
++  if (self->channel_mask)
++    aaudio.builder_setChannelMask (builder, self->channel_mask);
++  else
++    aaudio.builder_setChannelCount (builder, self->channels);
++  aaudio.builder_setBufferCapacityInFrames (builder, self->capacity_frames);
++  if (aaudio.builder_setUsage)
++    aaudio.builder_setUsage (builder, AAUDIO_USAGE_MEDIA);
++  if (aaudio.builder_setContentType)
++    aaudio.builder_setContentType (builder, AAUDIO_CONTENT_TYPE_MOVIE);
++
++  res = aaudio.builder_openStream (builder, &stream);
++  aaudio.builder_delete (builder);
++  if (res != AAUDIO_OK) {
++    GST_ERROR_OBJECT (self, "AAudioStreamBuilder_openStream (format %d, "
++        "rate %d, channels %d, mask 0x%x): %s", self->format, self->rate,
++        self->channels, self->channel_mask, result_text (res));
++    return FALSE;
++  }
++
++  /* Shared streams are converted by the framework, so anything else here
++   * would mean the data we write is not interpreted the way it is laid
++   * out. */
++  if (aaudio.stream_getFormat (stream) != self->format ||
++      aaudio.stream_getSampleRate (stream) != self->rate ||
++      aaudio.stream_getChannelCount (stream) != self->channels) {
++    GST_ERROR_OBJECT (self, "AAudio opened format %d, rate %d, channels %d, "
++        "instead of format %d, rate %d, channels %d",
++        aaudio.stream_getFormat (stream), aaudio.stream_getSampleRate (stream),
++        aaudio.stream_getChannelCount (stream), self->format, self->rate,
++        self->channels);
++    aaudio.stream_close (stream);
++    return FALSE;
++  }
++
++  GST_INFO_OBJECT (self, "opened stream: format %d, rate %d, channels %d, "
++      "mask 0x%x, capacity %d frames", self->format, self->rate,
++      self->channels, self->channel_mask,
++      aaudio.stream_getBufferCapacityInFrames (stream));
++
++  self->stream = stream;
++  self->started = FALSE;
++
++  return TRUE;
++}
++
++static gboolean
++gst_aaudio_sink_prepare (GstAudioSink * asink, GstAudioRingBufferSpec * spec)
++{
++  GstAAudioSink *self = GST_AAUDIO_SINK (asink);
++  gboolean ret;
++
++  if (gst_android_audio_spec_is_passthrough (spec)) {
++    self->format = AAUDIO_FORMAT_IEC61937;
++    self->rate = gst_android_audio_iec61937_rate (spec);
++    self->channels = 2;
++    self->channel_mask = 0;
++    self->device_bpf = 4;
++  } else {
++    switch (GST_AUDIO_INFO_FORMAT (&spec->info)) {
++      case GST_AUDIO_FORMAT_S16LE:
++        self->format = AAUDIO_FORMAT_PCM_I16;
++        break;
++      case GST_AUDIO_FORMAT_F32LE:
++        self->format = AAUDIO_FORMAT_PCM_FLOAT;
++        break;
++      case GST_AUDIO_FORMAT_S24LE:
++        self->format = AAUDIO_FORMAT_PCM_I24_PACKED;
++        break;
++      case GST_AUDIO_FORMAT_S32LE:
++        self->format = AAUDIO_FORMAT_PCM_I32;
++        break;
++      default:
++        GST_ERROR_OBJECT (self, "unsupported format %s",
++            GST_AUDIO_INFO_NAME (&spec->info));
++        return FALSE;
++    }
++
++    self->rate = GST_AUDIO_INFO_RATE (&spec->info);
++    self->channels = GST_AUDIO_INFO_CHANNELS (&spec->info);
++    self->channel_mask = 0;
++    if (self->channels > 2) {
++      self->channel_mask = gst_android_audio_channel_mask (&spec->info);
++      if (!self->channel_mask || !aaudio.builder_setChannelMask) {
++        GST_ERROR_OBJECT (self, "cannot open %d channels", self->channels);
++        return FALSE;
++      }
++    }
++    self->device_bpf = GST_AUDIO_INFO_BPF (&spec->info);
++  }
++
++  self->ring_bpf = GST_AUDIO_INFO_BPF (&spec->info);
++  self->capacity_frames =
++      gst_util_uint64_scale_int (spec->buffer_time, self->rate, G_USEC_PER_SEC);
++
++  g_mutex_lock (&self->lock);
++  ret = open_stream (self);
++  g_mutex_unlock (&self->lock);
++
++  if (!ret)
++    GST_ELEMENT_ERROR (self, RESOURCE, OPEN_WRITE, (NULL),
++        ("Could not open an AAudio stream"));
++
++  return ret;
++}
++
++static gboolean
++gst_aaudio_sink_unprepare (GstAudioSink * asink)
++{
++  GstAAudioSink *self = GST_AAUDIO_SINK (asink);
++
++  g_mutex_lock (&self->lock);
++  close_stream (self);
++  g_mutex_unlock (&self->lock);
++
++  return TRUE;
++}
++
++static gboolean
++ring_buffer_started (GstAAudioSink * self)
++{
++  GstAudioRingBuffer *buf = GST_AUDIO_BASE_SINK (self)->ringbuffer;
++
++  return g_atomic_int_get (&buf->state) == GST_AUDIO_RING_BUFFER_STATE_STARTED;
++}
++
++/* Writes as much as it can until the ring buffer leaves the started state,
++ * starting the stream first if needed: GstAudioSink has no hook for the
++ * first start, only for resuming. Returns the bytes written, which is 0 once
++ * paused or stopped. */
++static gint
++gst_aaudio_sink_write (GstAudioSink * asink, gpointer data, guint length)
++{
++  GstAAudioSink *self = GST_AAUDIO_SINK (asink);
++  guint8 *ptr = data;
++  gint32 frames = length / self->device_bpf;
++  gint32 done = 0;
++
++  while (done < frames) {
++    AAudioStream *stream;
++    aaudio_result_t res;
++
++    g_mutex_lock (&self->lock);
++    if (!ring_buffer_started (self)) {
++      g_mutex_unlock (&self->lock);
++      break;
++    }
++    if (!self->stream && !open_stream (self)) {
++      g_mutex_unlock (&self->lock);
++      GST_ELEMENT_ERROR (self, RESOURCE, OPEN_WRITE, (NULL),
++          ("Could not reopen the AAudio stream"));
++      return -1;
++    }
++    if (!self->started) {
++      res = aaudio.stream_requestStart (self->stream);
++      if (res != AAUDIO_OK) {
++        g_mutex_unlock (&self->lock);
++        GST_ELEMENT_ERROR (self, RESOURCE, WRITE, (NULL),
++            ("AAudioStream_requestStart: %s", result_text (res)));
++        return -1;
++      }
++      self->started = TRUE;
++    }
++    stream = self->stream;
++    g_mutex_unlock (&self->lock);
++
++    /* Outside the lock: pause and flush may be requested from another
++     * thread meanwhile, which AAudio allows. The stream itself is only
++     * replaced from this thread. */
++    res = aaudio.stream_write (stream, ptr + done * self->device_bpf,
++        frames - done, WRITE_TIMEOUT_NS);
++
++    if (res == AAUDIO_ERROR_DISCONNECTED) {
++      /* The route changed (HDMI replugged, a headset...). Reopen on the
++       * new one and carry on with the data we have. */
++      GST_INFO_OBJECT (self, "stream disconnected, reopening");
++      g_mutex_lock (&self->lock);
++      close_stream (self);
++      g_mutex_unlock (&self->lock);
++      continue;
++    } else if (res < 0) {
++      GST_ELEMENT_ERROR (self, RESOURCE, WRITE, (NULL),
++          ("AAudioStream_write: %s", result_text (res)));
++      return -1;
++    }
++
++    done += res;
++  }
++
++  return done * self->device_bpf;
++}
++
++static guint
++gst_aaudio_sink_delay (GstAudioSink * asink)
++{
++  GstAAudioSink *self = GST_AAUDIO_SINK (asink);
++  gint64 written, played, position, time_ns;
++  gint64 delay = 0;
++
++  g_mutex_lock (&self->lock);
++  if (!self->stream)
++    goto done;
++
++  written = aaudio.stream_getFramesWritten (self->stream);
++
++  if (self->started && aaudio.stream_getTimestamp (self->stream,
++          CLOCK_MONOTONIC, &position, &time_ns) == AAUDIO_OK) {
++    struct timespec now;
++
++    /* The frame presented at time_ns, carried forward to now. */
++    clock_gettime (CLOCK_MONOTONIC, &now);
++    played = position + gst_util_uint64_scale_int (MAX (0,
++            GST_TIMESPEC_TO_TIME (now) - time_ns), self->rate, GST_SECOND);
++  } else {
++    played = aaudio.stream_getFramesRead (self->stream);
++  }
++
++  delay = CLAMP (written - played, 0, written);
++  /* In ring buffer frames. */
++  delay = delay * self->device_bpf / self->ring_bpf;
++
++done:
++  g_mutex_unlock (&self->lock);
++
++  return (guint) delay;
++}
++
++/* With the lock. requestPause() is asynchronous and requestFlush() is only
++ * accepted once it has taken effect. */
++static void
++pause_stream (GstAAudioSink * self)
++{
++  aaudio_stream_state_t state;
++  aaudio_result_t res;
++
++  if (!self->started)
++    return;
++
++  res = aaudio.stream_requestPause (self->stream);
++  if (res != AAUDIO_OK)
++    GST_WARNING_OBJECT (self, "AAudioStream_requestPause: %s",
++        result_text (res));
++  else
++    aaudio.stream_waitForStateChange (self->stream,
++        AAUDIO_STREAM_STATE_PAUSING, &state, STATE_CHANGE_TIMEOUT_NS);
++
++  self->started = FALSE;
++}
++
++static void
++gst_aaudio_sink_pause (GstAudioSink * asink)
++{
++  GstAAudioSink *self = GST_AAUDIO_SINK (asink);
++
++  g_mutex_lock (&self->lock);
++  if (self->stream)
++    pause_stream (self);
++  g_mutex_unlock (&self->lock);
++}
++
++static void
++gst_aaudio_sink_stop (GstAudioSink * asink)
++{
++  GstAAudioSink *self = GST_AAUDIO_SINK (asink);
++  aaudio_result_t res;
++
++  g_mutex_lock (&self->lock);
++  if (self->stream) {
++    pause_stream (self);
++    res = aaudio.stream_requestFlush (self->stream);
++    if (res != AAUDIO_OK)
++      GST_WARNING_OBJECT (self, "AAudioStream_requestFlush: %s",
++          result_text (res));
++  }
++  g_mutex_unlock (&self->lock);
++}
++
++static void
++gst_aaudio_sink_finalize (GObject * object)
++{
++  GstAAudioSink *self = GST_AAUDIO_SINK (object);
++
++  g_mutex_clear (&self->lock);
++
++  G_OBJECT_CLASS (parent_class)->finalize (object);
++}
++
++static void
++gst_aaudio_sink_class_init (GstAAudioSinkClass * klass)
++{
++  GObjectClass *gobject_class = G_OBJECT_CLASS (klass);
++  GstElementClass *element_class = GST_ELEMENT_CLASS (klass);
++  GstBaseSinkClass *basesink_class = GST_BASE_SINK_CLASS (klass);
++  GstAudioBaseSinkClass *audiobasesink_class = GST_AUDIO_BASE_SINK_CLASS (klass);
++  GstAudioSinkClass *audiosink_class = GST_AUDIO_SINK_CLASS (klass);
++
++  gobject_class->set_property = gst_aaudio_sink_set_property;
++  gobject_class->get_property = gst_aaudio_sink_get_property;
++  gobject_class->finalize = gst_aaudio_sink_finalize;
++
++  /**
++   * GstAAudioSink:passthrough:
++   *
++   * Offer AC-3, E-AC-3 and DTS caps and send them as IEC 61937. Has an
++   * effect from API 34 on. AAudio cannot tell whether the output takes
++   * them, so only set this when the sink is known to.
++   */
++  g_object_class_install_property (gobject_class, PROP_PASSTHROUGH,
++      g_param_spec_boolean ("passthrough", "Passthrough",
++          "Offer AC-3, E-AC-3 and DTS for IEC 61937 passthrough (API 34+)",
++          DEFAULT_PASSTHROUGH, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
++
++  gst_element_class_add_static_pad_template (element_class, &sink_template);
++  gst_element_class_set_static_metadata (element_class, "AAudio Sink",
++      "Sink/Audio", "Output audio through AAudio",
++      "BuzzTV <max@buzztv.com>");
++
++  basesink_class->get_caps = GST_DEBUG_FUNCPTR (gst_aaudio_sink_getcaps);
++  basesink_class->query = GST_DEBUG_FUNCPTR (gst_aaudio_sink_query);
++
++  audiobasesink_class->payload = GST_DEBUG_FUNCPTR (gst_android_audio_payload);
++
++  audiosink_class->open = GST_DEBUG_FUNCPTR (gst_aaudio_sink_open);
++  audiosink_class->prepare = GST_DEBUG_FUNCPTR (gst_aaudio_sink_prepare);
++  audiosink_class->unprepare = GST_DEBUG_FUNCPTR (gst_aaudio_sink_unprepare);
++  audiosink_class->close = GST_DEBUG_FUNCPTR (gst_aaudio_sink_close);
++  audiosink_class->write = GST_DEBUG_FUNCPTR (gst_aaudio_sink_write);
++  audiosink_class->delay = GST_DEBUG_FUNCPTR (gst_aaudio_sink_delay);
++  audiosink_class->pause = GST_DEBUG_FUNCPTR (gst_aaudio_sink_pause);
++  audiosink_class->stop = GST_DEBUG_FUNCPTR (gst_aaudio_sink_stop);
++}
++
++static void
++gst_aaudio_sink_init (GstAAudioSink * self)
++{
++  g_mutex_init (&self->lock);
++  self->passthrough = DEFAULT_PASSTHROUGH;
++}
++
++static gboolean
++load_aaudio (void)
++{
++  GModule *lib = g_module_open ("libaaudio.so", G_MODULE_BIND_LOCAL);
++
++  if (!lib) {
++    GST_INFO ("no libaaudio: %s", g_module_error ());
++    return FALSE;
++  }
++
++#define REQUIRED(field, symbol) \
++  G_STMT_START { \
++    if (!g_module_symbol (lib, symbol, (gpointer *) &aaudio.field)) { \
++      GST_WARNING ("libaaudio has no %s", symbol); \
++      goto fail; \
++    } \
++  } G_STMT_END
++#define OPTIONAL(field, symbol) \
++  g_module_symbol (lib, symbol, (gpointer *) &aaudio.field)
++
++  REQUIRED (createStreamBuilder, "AAudio_createStreamBuilder");
++  REQUIRED (builder_setDirection, "AAudioStreamBuilder_setDirection");
++  REQUIRED (builder_setSharingMode, "AAudioStreamBuilder_setSharingMode");
++  REQUIRED (builder_setPerformanceMode,
++      "AAudioStreamBuilder_setPerformanceMode");
++  REQUIRED (builder_setFormat, "AAudioStreamBuilder_setFormat");
++  REQUIRED (builder_setSampleRate, "AAudioStreamBuilder_setSampleRate");
++  REQUIRED (builder_setChannelCount, "AAudioStreamBuilder_setChannelCount");
++  REQUIRED (builder_setBufferCapacityInFrames,
++      "AAudioStreamBuilder_setBufferCapacityInFrames");
++  REQUIRED (builder_openStream, "AAudioStreamBuilder_openStream");
++  REQUIRED (builder_delete, "AAudioStreamBuilder_delete");
++  REQUIRED (stream_close, "AAudioStream_close");
++  REQUIRED (stream_requestStart, "AAudioStream_requestStart");
++  REQUIRED (stream_requestPause, "AAudioStream_requestPause");
++  REQUIRED (stream_requestFlush, "AAudioStream_requestFlush");
++  REQUIRED (stream_waitForStateChange, "AAudioStream_waitForStateChange");
++  REQUIRED (stream_write, "AAudioStream_write");
++  REQUIRED (stream_getTimestamp, "AAudioStream_getTimestamp");
++  REQUIRED (stream_getFramesWritten, "AAudioStream_getFramesWritten");
++  REQUIRED (stream_getFramesRead, "AAudioStream_getFramesRead");
++  REQUIRED (stream_getState, "AAudioStream_getState");
++  REQUIRED (stream_getSampleRate, "AAudioStream_getSampleRate");
++  REQUIRED (stream_getChannelCount, "AAudioStream_getChannelCount");
++  REQUIRED (stream_getFormat, "AAudioStream_getFormat");
++  REQUIRED (stream_getBufferCapacityInFrames,
++      "AAudioStream_getBufferCapacityInFrames");
++  OPTIONAL (convertResultToText, "AAudio_convertResultToText");
++  /* API 28 */
++  OPTIONAL (builder_setUsage, "AAudioStreamBuilder_setUsage");
++  OPTIONAL (builder_setContentType, "AAudioStreamBuilder_setContentType");
++  /* API 32 */
++  OPTIONAL (builder_setChannelMask, "AAudioStreamBuilder_setChannelMask");
++
++#undef REQUIRED
++#undef OPTIONAL
++
++  /* libaaudio stays loaded for the life of the process. */
++  g_module_make_resident (lib);
++  return TRUE;
++
++fail:
++  g_module_close (lib);
++  memset (&aaudio, 0, sizeof (aaudio));
++  return FALSE;
++}
++
++gboolean
++gst_aaudio_sink_register (GstPlugin * plugin)
++{
++  GST_DEBUG_CATEGORY_INIT (aaudio_sink_debug, "aaudiosink", 0,
++      "AAudio sink");
++
++  if (!load_aaudio ())
++    return FALSE;
++
++  GST_INFO ("AAudio on API %d, channel masks %s",
++      gst_android_audio_get_api_level (),
++      aaudio.builder_setChannelMask ? "available" : "not available");
++
++  return gst_element_register (plugin, "aaudiosink", GST_RANK_NONE,
++      GST_TYPE_AAUDIO_SINK);
++}
+diff --git a/subprojects/gst-plugins-bad/sys/androidmedia/gstaaudiosink.h b/subprojects/gst-plugins-bad/sys/androidmedia/gstaaudiosink.h
+new file mode 100644
+index 0000000000..6bc820a657
+--- /dev/null
++++ b/subprojects/gst-plugins-bad/sys/androidmedia/gstaaudiosink.h
+@@ -0,0 +1,36 @@
++/*
++ * Copyright (C) 2026 BuzzTV
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Library General Public
++ * License as published by the Free Software Foundation; either
++ * version 2 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Library General Public License for more details.
++ *
++ * You should have received a copy of the GNU Library General Public
++ * License along with this library; if not, write to the
++ * Free Software Foundation, Inc., 51 Franklin St, Fifth Floor,
++ * Boston, MA 02110-1301, USA.
++ */
++
++#ifndef __GST_AAUDIO_SINK_H__
++#define __GST_AAUDIO_SINK_H__
++
++#include <gst/gst.h>
++#include <gst/audio/audio.h>
++
++G_BEGIN_DECLS
++
++#define GST_TYPE_AAUDIO_SINK (gst_aaudio_sink_get_type ())
++G_DECLARE_FINAL_TYPE (GstAAudioSink, gst_aaudio_sink, GST, AAUDIO_SINK,
++    GstAudioSink)
++
++gboolean gst_aaudio_sink_register (GstPlugin * plugin);
++
++G_END_DECLS
++
++#endif /* __GST_AAUDIO_SINK_H__ */
+diff --git a/subprojects/gst-plugins-bad/sys/androidmedia/gstamc.c b/subprojects/gst-plugins-bad/sys/androidmedia/gstamc.c
+index 6f00c708fa..d38f1b1191 100644
+--- a/subprojects/gst-plugins-bad/sys/androidmedia/gstamc.c
++++ b/subprojects/gst-plugins-bad/sys/androidmedia/gstamc.c
+@@ -42,6 +42,10 @@
+ #include "gstamcvideodec.h"
+ #include "gstamcvideoenc.h"
+ #include "gstamcaudiodec.h"
++#include "gstaaudiosink.h"
++#ifdef HAVE_JNI_H
++#include "gstaudiotracksink.h"
++#endif
+ 
+ #include <gst/gst.h>
+ #include <gst/video/video.h>
+@@ -2036,8 +2040,14 @@ plugin_init (GstPlugin * plugin)
+ 
+   if (ahs_init (plugin))
+     init_ok = TRUE;
++
++  if (gst_audio_track_sink_register (plugin))
++    init_ok = TRUE;
+ #endif
+ 
++  if (gst_aaudio_sink_register (plugin))
++    init_ok = TRUE;
++
+   return init_ok;
+ }
+ 
+diff --git a/subprojects/gst-plugins-bad/sys/androidmedia/gstandroidaudio.c b/subprojects/gst-plugins-bad/sys/androidmedia/gstandroidaudio.c
+new file mode 100644
+index 0000000000..134c5167bd
+--- /dev/null
++++ b/subprojects/gst-plugins-bad/sys/androidmedia/gstandroidaudio.c
+@@ -0,0 +1,286 @@
++/*
++ * Copyright (C) 2026 BuzzTV
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Library General Public
++ * License as published by the Free Software Foundation; either
++ * version 2 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Library General Public License for more details.
++ *
++ * You should have received a copy of the GNU Library General Public
++ * License along with this library; if not, write to the
++ * Free Software Foundation, Inc., 51 Franklin St, Fifth Floor,
++ * Boston, MA 02110-1301, USA.
++ */
++
++#ifdef HAVE_CONFIG_H
++#include "config.h"
++#endif
++
++#include <stdlib.h>
++#include <sys/system_properties.h>
++
++#include "gstandroidaudio.h"
++
++#define POS(p) GST_AUDIO_CHANNEL_POSITION_MASK (p)
++
++#define GST_FL POS (FRONT_LEFT)
++#define GST_FR POS (FRONT_RIGHT)
++#define GST_FC POS (FRONT_CENTER)
++#define GST_LFE POS (LFE1)
++#define GST_RL POS (REAR_LEFT)
++#define GST_RR POS (REAR_RIGHT)
++#define GST_RC POS (REAR_CENTER)
++#define GST_SL POS (SIDE_LEFT)
++#define GST_SR POS (SIDE_RIGHT)
++
++/* AAudio's AAUDIO_CHANNEL_* bits */
++#define AA_FL (1 << 0)
++#define AA_FR (1 << 1)
++#define AA_FC (1 << 2)
++#define AA_LFE (1 << 3)
++#define AA_BL (1 << 4)
++#define AA_BR (1 << 5)
++#define AA_BC (1 << 8)
++#define AA_SL (1 << 9)
++#define AA_SR (1 << 10)
++
++typedef struct
++{
++  gint channels;
++  guint64 gst_mask;
++  guint32 android_mask;
++} Layout;
++
++/* The layouts Android's own players open (the same table as ExoPlayer's and
++ * mpv's AudioTrack outputs). The side-surround variants that AC-3 and AAC
++ * decoders commonly emit map onto the back-surround Android layout of the
++ * same channel count: both orders put those two channels in the same slots,
++ * so no reordering is involved, and Android itself treats "5.1" as
++ * back-surround. Every GStreamer layout listed is in canonical order that
++ * matches the Android order of its mask, so the ring buffer never has to
++ * reorder. */
++static const Layout layouts[] = {
++  {1, 0, AA_FL},
++  {2, GST_FL | GST_FR, AA_FL | AA_FR},
++  {3, GST_FL | GST_FR | GST_FC, AA_FL | AA_FR | AA_FC},
++  {4, GST_FL | GST_FR | GST_RL | GST_RR, AA_FL | AA_FR | AA_BL | AA_BR},
++  {4, GST_FL | GST_FR | GST_SL | GST_SR, AA_FL | AA_FR | AA_BL | AA_BR},
++  {5, GST_FL | GST_FR | GST_FC | GST_RL | GST_RR,
++      AA_FL | AA_FR | AA_FC | AA_BL | AA_BR},
++  {5, GST_FL | GST_FR | GST_FC | GST_SL | GST_SR,
++      AA_FL | AA_FR | AA_FC | AA_BL | AA_BR},
++  {6, GST_FL | GST_FR | GST_FC | GST_LFE | GST_RL | GST_RR,
++      AA_FL | AA_FR | AA_FC | AA_LFE | AA_BL | AA_BR},
++  {6, GST_FL | GST_FR | GST_FC | GST_LFE | GST_SL | GST_SR,
++      AA_FL | AA_FR | AA_FC | AA_LFE | AA_BL | AA_BR},
++  {7, GST_FL | GST_FR | GST_FC | GST_LFE | GST_RL | GST_RR | GST_RC,
++      AA_FL | AA_FR | AA_FC | AA_LFE | AA_BL | AA_BR | AA_BC},
++  {8, GST_FL | GST_FR | GST_FC | GST_LFE | GST_RL | GST_RR | GST_SL | GST_SR,
++      AA_FL | AA_FR | AA_FC | AA_LFE | AA_BL | AA_BR | AA_SL | AA_SR},
++};
++
++gint
++gst_android_audio_get_api_level (void)
++{
++  static gsize api_level = 0;
++
++  if (g_once_init_enter (&api_level)) {
++    char value[PROP_VALUE_MAX] = { 0, };
++    gint level = 0;
++
++    if (__system_property_get ("ro.build.version.sdk", value) > 0)
++      level = atoi (value);
++
++    g_once_init_leave (&api_level, level > 0 ? level : 1);
++  }
++
++  return (gint) api_level;
++}
++
++/* One structure per layout, each carrying every format in @formats. */
++GstCaps *
++gst_android_audio_pcm_caps (const gchar * const *formats, gint max_channels)
++{
++  GstCaps *caps = gst_caps_new_empty ();
++  GValue format_list = G_VALUE_INIT;
++  guint i;
++
++  gst_value_list_init (&format_list, 0);
++  for (i = 0; formats[i]; i++) {
++    GValue v = G_VALUE_INIT;
++
++    g_value_init (&v, G_TYPE_STRING);
++    g_value_set_string (&v, formats[i]);
++    gst_value_list_append_and_take_value (&format_list, &v);
++  }
++
++  for (i = 0; i < G_N_ELEMENTS (layouts); i++) {
++    GstStructure *s;
++
++    if (layouts[i].channels > max_channels)
++      break;
++
++    s = gst_structure_new ("audio/x-raw",
++        "layout", G_TYPE_STRING, "interleaved",
++        "rate", GST_TYPE_INT_RANGE, 8000, 192000,
++        "channels", G_TYPE_INT, layouts[i].channels, NULL);
++    gst_structure_set_value (s, "format", &format_list);
++    if (layouts[i].channels > 1)
++      gst_structure_set (s, "channel-mask", GST_TYPE_BITMASK,
++          layouts[i].gst_mask, NULL);
++
++    gst_caps_append_structure (caps, s);
++  }
++
++  g_value_unset (&format_list);
++
++  return caps;
++}
++
++/* Parsed frames only, one per buffer, as gst_audio_iec61937_payload() needs.
++ * E-AC-3 is taken frame-aligned: the upstream payloader refuses
++ * alignment=iec61937, so a stream whose frames have fewer than six audio
++ * blocks is not packed as the standard wants. Broadcast E-AC-3 uses six. */
++GstCaps *
++gst_android_audio_passthrough_caps (guint passthrough)
++{
++  GstCaps *caps = gst_caps_new_empty ();
++
++  if (passthrough & GST_ANDROID_AUDIO_PASSTHROUGH_AC3)
++    gst_caps_append (caps,
++        gst_caps_from_string ("audio/x-ac3, framed = (boolean) true, "
++            "rate = (int) { 32000, 44100, 48000 }"));
++  if (passthrough & GST_ANDROID_AUDIO_PASSTHROUGH_EAC3)
++    gst_caps_append (caps,
++        gst_caps_from_string ("audio/x-eac3, framed = (boolean) true, "
++            "alignment = (string) frame, rate = (int) { 32000, 44100, 48000 }"));
++  if (passthrough & GST_ANDROID_AUDIO_PASSTHROUGH_DTS)
++    gst_caps_append (caps,
++        gst_caps_from_string ("audio/x-dts, framed = (boolean) true, "
++            "block-size = (int) { 512, 1024, 2048 }, "
++            "rate = (int) { 32000, 44100, 48000 }"));
++
++  return caps;
++}
++
++/* The Android (AAudio-numbered) mask for @info, or 0 if the layout is not one
++ * the sinks open. */
++guint32
++gst_android_audio_channel_mask (const GstAudioInfo * info)
++{
++  guint64 gst_mask = 0;
++  guint i;
++
++  if (info->channels > 1 &&
++      !gst_audio_channel_positions_to_mask (info->position, info->channels,
++          FALSE, &gst_mask))
++    return 0;
++
++  for (i = 0; i < G_N_ELEMENTS (layouts); i++) {
++    if (layouts[i].channels == info->channels &&
++        (info->channels == 1 || layouts[i].gst_mask == gst_mask))
++      return layouts[i].android_mask;
++  }
++
++  return 0;
++}
++
++gboolean
++gst_android_audio_spec_is_passthrough (const GstAudioRingBufferSpec * spec)
++{
++  switch (spec->type) {
++    case GST_AUDIO_RING_BUFFER_FORMAT_TYPE_AC3:
++    case GST_AUDIO_RING_BUFFER_FORMAT_TYPE_EAC3:
++    case GST_AUDIO_RING_BUFFER_FORMAT_TYPE_DTS:
++      return TRUE;
++    default:
++      return FALSE;
++  }
++}
++
++/* The rate of the 2-channel, 16-bit IEC 61937 stream carrying @spec: the
++ * codec rate for AC-3 and DTS, four times it for E-AC-3, whose ring buffer
++ * frames are 16 bytes wide. */
++gint
++gst_android_audio_iec61937_rate (const GstAudioRingBufferSpec * spec)
++{
++  return GST_AUDIO_INFO_RATE (&spec->info) * (GST_AUDIO_INFO_BPF (&spec->info)
++      / 4);
++}
++
++/* Beyond the caps intersection: compressed input must be framed and have a
++ * size the payloader can handle, as in alsasink. */
++gboolean
++gst_android_audio_accept_caps (GstAudioBaseSink * sink, GstCaps * caps)
++{
++  GstPad *pad = GST_BASE_SINK_PAD (sink);
++  GstAudioRingBufferSpec spec = { 0, };
++  GstCaps *pad_caps;
++  gboolean ret = FALSE;
++
++  pad_caps = gst_pad_query_caps (pad, caps);
++  if (!pad_caps || gst_caps_is_empty (pad_caps)) {
++    gst_clear_caps (&pad_caps);
++    return FALSE;
++  }
++  gst_caps_unref (pad_caps);
++
++  if (!gst_caps_is_fixed (caps))
++    return TRUE;
++
++  spec.latency_time = GST_SECOND;
++  if (!gst_audio_ring_buffer_parse_caps (&spec, caps))
++    goto done;
++
++  if (gst_android_audio_spec_is_passthrough (&spec)) {
++    ret = gst_audio_iec61937_frame_size (&spec) > 0;
++  } else {
++    ret = spec.type == GST_AUDIO_RING_BUFFER_FORMAT_TYPE_RAW &&
++        gst_android_audio_channel_mask (&spec.info) != 0;
++  }
++
++done:
++  gst_caps_replace (&spec.caps, NULL);
++  return ret;
++}
++
++/* Android takes IEC 61937 as native-endian 16-bit words. */
++GstBuffer *
++gst_android_audio_payload (GstAudioBaseSink * sink, GstBuffer * buf)
++{
++  GstAudioRingBufferSpec *spec = &sink->ringbuffer->spec;
++  GstMapInfo iinfo, oinfo;
++  GstBuffer *out;
++  gint framesize;
++
++  if (!gst_android_audio_spec_is_passthrough (spec))
++    return gst_buffer_ref (buf);
++
++  framesize = gst_audio_iec61937_frame_size (spec);
++  if (framesize <= 0)
++    return NULL;
++
++  out = gst_buffer_new_and_alloc (framesize);
++
++  gst_buffer_map (buf, &iinfo, GST_MAP_READ);
++  gst_buffer_map (out, &oinfo, GST_MAP_WRITE);
++
++  if (!gst_audio_iec61937_payload (iinfo.data, iinfo.size,
++          oinfo.data, oinfo.size, spec, G_BYTE_ORDER)) {
++    gst_buffer_unmap (buf, &iinfo);
++    gst_buffer_unmap (out, &oinfo);
++    gst_buffer_unref (out);
++    return NULL;
++  }
++
++  gst_buffer_unmap (buf, &iinfo);
++  gst_buffer_unmap (out, &oinfo);
++
++  gst_buffer_copy_into (out, buf, GST_BUFFER_COPY_METADATA, 0, -1);
++  return out;
++}
+diff --git a/subprojects/gst-plugins-bad/sys/androidmedia/gstandroidaudio.h b/subprojects/gst-plugins-bad/sys/androidmedia/gstandroidaudio.h
+new file mode 100644
+index 0000000000..c22c09fd9a
+--- /dev/null
++++ b/subprojects/gst-plugins-bad/sys/androidmedia/gstandroidaudio.h
+@@ -0,0 +1,68 @@
++/*
++ * Copyright (C) 2026 BuzzTV
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Library General Public
++ * License as published by the Free Software Foundation; either
++ * version 2 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Library General Public License for more details.
++ *
++ * You should have received a copy of the GNU Library General Public
++ * License along with this library; if not, write to the
++ * Free Software Foundation, Inc., 51 Franklin St, Fifth Floor,
++ * Boston, MA 02110-1301, USA.
++ */
++
++#ifndef __GST_ANDROID_AUDIO_H__
++#define __GST_ANDROID_AUDIO_H__
++
++#include <gst/gst.h>
++#include <gst/audio/audio.h>
++
++G_BEGIN_DECLS
++
++/* Helpers shared by aaudiosink and audiotracksink. */
++
++/* Android channel masks are given in AAudio's numbering
++ * (AAUDIO_CHANNEL_FRONT_LEFT = 1 << 0); the Java AudioFormat.CHANNEL_OUT_*
++ * value of the same layout is this mask shifted left by 2. */
++#define GST_ANDROID_AUDIO_JAVA_CHANNEL_MASK(m) ((gint) ((m) << 2))
++
++/* Passthrough formats a sink can carry as IEC 61937. */
++typedef enum
++{
++  GST_ANDROID_AUDIO_PASSTHROUGH_AC3 = (1 << 0),
++  GST_ANDROID_AUDIO_PASSTHROUGH_EAC3 = (1 << 1),
++  GST_ANDROID_AUDIO_PASSTHROUGH_DTS = (1 << 2),
++} GstAndroidAudioPassthrough;
++
++#define GST_ANDROID_AUDIO_PASSTHROUGH_ALL \
++  (GST_ANDROID_AUDIO_PASSTHROUGH_AC3 | GST_ANDROID_AUDIO_PASSTHROUGH_EAC3 | \
++   GST_ANDROID_AUDIO_PASSTHROUGH_DTS)
++
++gint       gst_android_audio_get_api_level        (void);
++
++GstCaps *  gst_android_audio_pcm_caps             (const gchar * const * formats,
++                                                   gint max_channels);
++
++GstCaps *  gst_android_audio_passthrough_caps     (guint passthrough);
++
++guint32    gst_android_audio_channel_mask         (const GstAudioInfo * info);
++
++gboolean   gst_android_audio_spec_is_passthrough  (const GstAudioRingBufferSpec * spec);
++
++gint       gst_android_audio_iec61937_rate        (const GstAudioRingBufferSpec * spec);
++
++gboolean   gst_android_audio_accept_caps          (GstAudioBaseSink * sink,
++                                                   GstCaps * caps);
++
++GstBuffer * gst_android_audio_payload             (GstAudioBaseSink * sink,
++                                                   GstBuffer * buf);
++
++G_END_DECLS
++
++#endif /* __GST_ANDROID_AUDIO_H__ */
+diff --git a/subprojects/gst-plugins-bad/sys/androidmedia/gstaudiotracksink.c b/subprojects/gst-plugins-bad/sys/androidmedia/gstaudiotracksink.c
+new file mode 100644
+index 0000000000..67a41acebe
+--- /dev/null
++++ b/subprojects/gst-plugins-bad/sys/androidmedia/gstaudiotracksink.c
+@@ -0,0 +1,1222 @@
++/*
++ * Copyright (C) 2026 BuzzTV
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Library General Public
++ * License as published by the Free Software Foundation; either
++ * version 2 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Library General Public License for more details.
++ *
++ * You should have received a copy of the GNU Library General Public
++ * License along with this library; if not, write to the
++ * Free Software Foundation, Inc., 51 Franklin St, Fifth Floor,
++ * Boston, MA 02110-1301, USA.
++ */
++
++/**
++ * SECTION:element-audiotracksink
++ * @title: audiotracksink
++ *
++ * Audio sink on android.media.AudioTrack.
++ *
++ * Plays PCM in the layouts Android opens, mono to 7.1 (see the pad
++ * template). With #GstAudioTrackSink:passthrough set it also takes parsed
++ * AC-3, E-AC-3 and DTS and sends them as IEC 61937
++ * (AudioFormat.ENCODING_IEC61937) for an external decoder. From API 29 only
++ * the codecs AudioTrack.isDirectPlaybackSupported() reports for the current
++ * output are offered; before that all three are, and a track the output
++ * cannot take fails to open.
++ *
++ * Every JNI call is made on one thread the element owns, never on the
++ * threads that change its state, so no thread the application created is
++ * ever attached to the VM by this element.
++ *
++ * ## Example pipeline
++ * |[
++ * gst-launch-1.0 audiotestsrc ! audioconvert ! audio/x-raw,channels=6 ! audiotracksink
++ * ]|
++ */
++
++#ifdef HAVE_CONFIG_H
++#include "config.h"
++#endif
++
++#include <time.h>
++
++#include "gstaudiotracksink.h"
++#include "gstandroidaudio.h"
++#include "gstjniutils.h"
++
++GST_DEBUG_CATEGORY_STATIC (audio_track_sink_debug);
++#define GST_CAT_DEFAULT audio_track_sink_debug
++
++/* android.media constants */
++#define ENCODING_PCM_16BIT 2
++#define ENCODING_PCM_FLOAT 4
++#define ENCODING_AC3 5
++#define ENCODING_E_AC3 6
++#define ENCODING_DTS 7
++#define ENCODING_IEC61937 13
++#define ENCODING_PCM_24BIT_PACKED 21
++#define ENCODING_PCM_32BIT 22
++#define CHANNEL_OUT_STEREO 12
++#define USAGE_MEDIA 1
++#define CONTENT_TYPE_MOVIE 3
++#define MODE_STREAM 1
++#define STATE_INITIALIZED 1
++#define WRITE_NON_BLOCKING 1
++#define ERROR_DEAD_OBJECT (-6)
++
++/* How long the writer waits before offering data again to a full track. */
++#define FULL_WAIT_US 5000
++/* A timestamp older than this is not extrapolated from. */
++#define TIMESTAMP_MAX_AGE (GST_SECOND)
++
++static struct
++{
++  jclass track, track_builder, format_builder, attributes_builder, timestamp;
++
++  jmethodID track_play, track_pause, track_flush, track_release;
++  jmethodID track_write_buffer, track_write_shorts;
++  jmethodID track_get_playback_head_position, track_get_timestamp;
++  jmethodID track_get_state, track_get_min_buffer_size;
++  jmethodID track_is_direct_playback_supported;       /* API 29, may be NULL */
++
++  jmethodID track_builder_ctor, track_builder_set_audio_attributes;
++  jmethodID track_builder_set_audio_format, track_builder_set_buffer_size;
++  jmethodID track_builder_set_transfer_mode, track_builder_build;
++
++  jmethodID format_builder_ctor, format_builder_set_encoding;
++  jmethodID format_builder_set_sample_rate, format_builder_set_channel_mask;
++  jmethodID format_builder_build;
++
++  jmethodID attributes_builder_ctor, attributes_builder_set_usage;
++  jmethodID attributes_builder_set_content_type, attributes_builder_build;
++
++  jmethodID timestamp_ctor;
++  jfieldID timestamp_frame_position, timestamp_nano_time;
++} jni;
++
++typedef void (*JobFunc) (GstAudioTrackSink * self, JNIEnv * env,
++    gpointer data);
++
++typedef struct
++{
++  JobFunc func;
++  gpointer data;
++  gboolean done;
++} Job;
++
++struct _GstAudioTrackSink
++{
++  GstAudioSink parent;
++
++  /* with the object lock */
++  gboolean passthrough;
++  guint supported_passthrough;
++
++  /* The JNI thread and its queue of Jobs. */
++  GThread *worker;
++  GAsyncQueue *jobs;
++  GMutex job_lock;
++  GCond job_cond;
++
++  /* Only touched from the JNI thread. */
++  jobject track;
++  jobject timestamp;
++  jshortArray shorts;
++  gint shorts_len;
++  gboolean playing;
++  guint64 head_position;
++  gint64 frames_written;
++
++  /* Set in prepare(), before the track exists. */
++  gint encoding;
++  gint rate;
++  gint channel_mask;
++  gboolean iec61937;
++  gint device_bpf;
++  gint ring_bpf;
++
++  /* The last position the JNI thread read, for delay(), which is called
++   * from any thread and so must not make JNI calls. */
++  GMutex lock;
++  gboolean position_valid;
++  gboolean position_playing;
++  gint64 position_written;
++  gint64 position_played;
++  GstClockTime position_time;
++};
++
++enum
++{
++  PROP_0,
++  PROP_PASSTHROUGH,
++};
++
++#define DEFAULT_PASSTHROUGH FALSE
++
++#define PCM_FORMATS "{ F32LE, S16LE, S32LE, S24LE }"
++#define PCM_STRUCTURE(n, mask) \
++  "audio/x-raw, format = (string) " PCM_FORMATS ", " \
++  "layout = (string) interleaved, rate = (int) [ 8000, 192000 ], " \
++  "channels = (int) " G_STRINGIFY (n) ", channel-mask = (bitmask) " mask "; "
++
++static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE ("sink",
++    GST_PAD_SINK,
++    GST_PAD_ALWAYS,
++    GST_STATIC_CAPS ("audio/x-raw, format = (string) " PCM_FORMATS ", "
++        "layout = (string) interleaved, rate = (int) [ 8000, 192000 ], "
++        "channels = (int) 1; "
++        PCM_STRUCTURE (2, "0x3")
++        PCM_STRUCTURE (3, "0x7")
++        PCM_STRUCTURE (4, "0x33")
++        PCM_STRUCTURE (4, "0xc03")
++        PCM_STRUCTURE (5, "0x37")
++        PCM_STRUCTURE (5, "0xc07")
++        PCM_STRUCTURE (6, "0x3f")
++        PCM_STRUCTURE (6, "0xc0f")
++        PCM_STRUCTURE (7, "0x13f")
++        PCM_STRUCTURE (8, "0xc3f")
++        "audio/x-ac3, framed = (boolean) true, "
++        "rate = (int) { 32000, 44100, 48000 }; "
++        "audio/x-eac3, framed = (boolean) true, alignment = (string) frame, "
++        "rate = (int) { 32000, 44100, 48000 }; "
++        "audio/x-dts, framed = (boolean) true, "
++        "block-size = (int) { 512, 1024, 2048 }, "
++        "rate = (int) { 32000, 44100, 48000 }"));
++
++#define gst_audio_track_sink_parent_class parent_class
++G_DEFINE_TYPE (GstAudioTrackSink, gst_audio_track_sink, GST_TYPE_AUDIO_SINK);
++
++static GstClockTime
++monotonic_time (void)
++{
++  struct timespec now;
++
++  clock_gettime (CLOCK_MONOTONIC, &now);
++  return GST_TIMESPEC_TO_TIME (now);
++}
++
++/* JNI thread */
++
++static gpointer
++worker_func (gpointer user_data)
++{
++  GstAudioTrackSink *self = user_data;
++  JNIEnv *env = gst_amc_jni_get_env ();
++
++  while (TRUE) {
++    Job *job = g_async_queue_pop (self->jobs);
++    gboolean quit = job->func == NULL;
++
++    if (!quit)
++      job->func (self, env, job->data);
++
++    g_mutex_lock (&self->job_lock);
++    job->done = TRUE;
++    g_cond_broadcast (&self->job_cond);
++    g_mutex_unlock (&self->job_lock);
++
++    if (quit)
++      break;
++  }
++
++  /* gstjniutils detaches the thread when it exits. */
++  return NULL;
++}
++
++/* Runs @func on the JNI thread and waits for it. */
++static void
++invoke (GstAudioTrackSink * self, JobFunc func, gpointer data)
++{
++  Job job = { func, data, FALSE };
++
++  /* open() failed, or close() already ran */
++  if (!self->worker) {
++    GST_WARNING_OBJECT (self, "no JNI thread");
++    return;
++  }
++
++  if (g_thread_self () == self->worker) {
++    func (self, gst_amc_jni_get_env (), data);
++    return;
++  }
++
++  g_async_queue_push (self->jobs, &job);
++
++  g_mutex_lock (&self->job_lock);
++  while (!job.done)
++    g_cond_wait (&self->job_cond, &self->job_lock);
++  g_mutex_unlock (&self->job_lock);
++}
++
++static gboolean
++start_worker (GstAudioTrackSink * self)
++{
++  GError *err = NULL;
++
++  self->jobs = g_async_queue_new ();
++  self->worker = g_thread_try_new ("audiotrack-jni", worker_func, self, &err);
++  if (!self->worker) {
++    GST_ERROR_OBJECT (self, "could not start the JNI thread: %s",
++        err->message);
++    g_clear_error (&err);
++    g_clear_pointer (&self->jobs, g_async_queue_unref);
++    return FALSE;
++  }
++
++  return TRUE;
++}
++
++static void
++stop_worker (GstAudioTrackSink * self)
++{
++  if (!self->worker)
++    return;
++
++  invoke (self, NULL, NULL);
++  g_thread_join (self->worker);
++  self->worker = NULL;
++  g_clear_pointer (&self->jobs, g_async_queue_unref);
++}
++
++static gboolean
++init_jni (JNIEnv * env, GError ** err)
++{
++  static GMutex init_lock;
++  static gboolean initialized = FALSE, ok = FALSE;
++
++  g_mutex_lock (&init_lock);
++  if (initialized)
++    goto done;
++  initialized = TRUE;
++
++#define CLASS(field, name) \
++  if (!(jni.field = gst_amc_jni_get_class (env, err, name))) goto done
++#define METHOD(field, klass, name, sig) \
++  if (!(jni.field = gst_amc_jni_get_method_id (env, err, jni.klass, name, sig))) goto done
++#define STATIC_METHOD(field, klass, name, sig) \
++  if (!(jni.field = gst_amc_jni_get_static_method_id (env, err, jni.klass, name, sig))) goto done
++
++  CLASS (track, "android/media/AudioTrack");
++  CLASS (track_builder, "android/media/AudioTrack$Builder");
++  CLASS (format_builder, "android/media/AudioFormat$Builder");
++  CLASS (attributes_builder, "android/media/AudioAttributes$Builder");
++  CLASS (timestamp, "android/media/AudioTimestamp");
++
++  METHOD (track_play, track, "play", "()V");
++  METHOD (track_pause, track, "pause", "()V");
++  METHOD (track_flush, track, "flush", "()V");
++  METHOD (track_release, track, "release", "()V");
++  METHOD (track_write_buffer, track, "write", "(Ljava/nio/ByteBuffer;II)I");
++  METHOD (track_write_shorts, track, "write", "([SIII)I");
++  METHOD (track_get_playback_head_position, track, "getPlaybackHeadPosition",
++      "()I");
++  METHOD (track_get_timestamp, track, "getTimestamp",
++      "(Landroid/media/AudioTimestamp;)Z");
++  METHOD (track_get_state, track, "getState", "()I");
++  STATIC_METHOD (track_get_min_buffer_size, track, "getMinBufferSize",
++      "(III)I");
++
++  METHOD (track_builder_ctor, track_builder, "<init>", "()V");
++  METHOD (track_builder_set_audio_attributes, track_builder,
++      "setAudioAttributes",
++      "(Landroid/media/AudioAttributes;)Landroid/media/AudioTrack$Builder;");
++  METHOD (track_builder_set_audio_format, track_builder, "setAudioFormat",
++      "(Landroid/media/AudioFormat;)Landroid/media/AudioTrack$Builder;");
++  METHOD (track_builder_set_buffer_size, track_builder,
++      "setBufferSizeInBytes", "(I)Landroid/media/AudioTrack$Builder;");
++  METHOD (track_builder_set_transfer_mode, track_builder, "setTransferMode",
++      "(I)Landroid/media/AudioTrack$Builder;");
++  METHOD (track_builder_build, track_builder, "build",
++      "()Landroid/media/AudioTrack;");
++
++  METHOD (format_builder_ctor, format_builder, "<init>", "()V");
++  METHOD (format_builder_set_encoding, format_builder, "setEncoding",
++      "(I)Landroid/media/AudioFormat$Builder;");
++  METHOD (format_builder_set_sample_rate, format_builder, "setSampleRate",
++      "(I)Landroid/media/AudioFormat$Builder;");
++  METHOD (format_builder_set_channel_mask, format_builder, "setChannelMask",
++      "(I)Landroid/media/AudioFormat$Builder;");
++  METHOD (format_builder_build, format_builder, "build",
++      "()Landroid/media/AudioFormat;");
++
++  METHOD (attributes_builder_ctor, attributes_builder, "<init>", "()V");
++  METHOD (attributes_builder_set_usage, attributes_builder, "setUsage",
++      "(I)Landroid/media/AudioAttributes$Builder;");
++  METHOD (attributes_builder_set_content_type, attributes_builder,
++      "setContentType", "(I)Landroid/media/AudioAttributes$Builder;");
++  METHOD (attributes_builder_build, attributes_builder, "build",
++      "()Landroid/media/AudioAttributes;");
++
++  METHOD (timestamp_ctor, timestamp, "<init>", "()V");
++  if (!(jni.timestamp_frame_position = gst_amc_jni_get_field_id (env, err,
++              jni.timestamp, "framePosition", "J")))
++    goto done;
++  if (!(jni.timestamp_nano_time = gst_amc_jni_get_field_id (env, err,
++              jni.timestamp, "nanoTime", "J")))
++    goto done;
++
++  if (gst_android_audio_get_api_level () >= 29)
++    STATIC_METHOD (track_is_direct_playback_supported, track,
++        "isDirectPlaybackSupported",
++        "(Landroid/media/AudioFormat;Landroid/media/AudioAttributes;)Z");
++
++#undef CLASS
++#undef METHOD
++#undef STATIC_METHOD
++
++  ok = TRUE;
++
++done:
++  if (!ok && err && !*err)
++    g_set_error (err, GST_LIBRARY_ERROR, GST_LIBRARY_ERROR_INIT,
++        "AudioTrack JNI initialization failed earlier");
++  g_mutex_unlock (&init_lock);
++  return ok;
++}
++
++/* Calls a Builder setter taking an int or an object, dropping the builder
++ * reference it returns. */
++static gboolean
++builder_set_int (JNIEnv * env, GError ** err, jobject builder,
++    jmethodID method, gint value)
++{
++  jobject ret = NULL;
++
++  if (!gst_amc_jni_call_object_method (env, err, builder, method, &ret,
++          (jint) value))
++    return FALSE;
++  gst_amc_jni_object_local_unref (env, ret);
++  return TRUE;
++}
++
++static gboolean
++builder_set_object (JNIEnv * env, GError ** err, jobject builder,
++    jmethodID method, jobject value)
++{
++  jobject ret = NULL;
++
++  if (!gst_amc_jni_call_object_method (env, err, builder, method, &ret, value))
++    return FALSE;
++  gst_amc_jni_object_local_unref (env, ret);
++  return TRUE;
++}
++
++/* Local reference, or NULL */
++static jobject
++build_attributes (JNIEnv * env, GError ** err)
++{
++  jobject builder, attributes = NULL;
++
++  builder = gst_amc_jni_new_object (env, err, FALSE, jni.attributes_builder,
++      jni.attributes_builder_ctor);
++  if (!builder)
++    return NULL;
++
++  if (builder_set_int (env, err, builder, jni.attributes_builder_set_usage,
++          USAGE_MEDIA) &&
++      builder_set_int (env, err, builder,
++          jni.attributes_builder_set_content_type, CONTENT_TYPE_MOVIE))
++    gst_amc_jni_call_object_method (env, err, builder,
++        jni.attributes_builder_build, &attributes);
++
++  gst_amc_jni_object_local_unref (env, builder);
++  return attributes;
++}
++
++/* Local reference, or NULL */
++static jobject
++build_format (JNIEnv * env, GError ** err, gint encoding, gint rate,
++    gint channel_mask)
++{
++  jobject builder, format = NULL;
++
++  builder = gst_amc_jni_new_object (env, err, FALSE, jni.format_builder,
++      jni.format_builder_ctor);
++  if (!builder)
++    return NULL;
++
++  if (builder_set_int (env, err, builder, jni.format_builder_set_encoding,
++          encoding) &&
++      builder_set_int (env, err, builder, jni.format_builder_set_sample_rate,
++          rate) &&
++      builder_set_int (env, err, builder, jni.format_builder_set_channel_mask,
++          channel_mask))
++    gst_amc_jni_call_object_method (env, err, builder,
++        jni.format_builder_build, &format);
++
++  gst_amc_jni_object_local_unref (env, builder);
++  return format;
++}
++
++static void
++log_error (GstAudioTrackSink * self, const gchar * what, GError ** err)
++{
++  GST_ERROR_OBJECT (self, "%s: %s", what, *err ? (*err)->message : "failed");
++  g_clear_error (err);
++}
++
++/* Which passthrough codecs to offer. isDirectPlaybackSupported() is asked
++ * about each codec's own encoding, which is what reflects the capabilities
++ * of the sink at the end of the HDMI link; they are then sent as IEC 61937
++ * regardless, as mpv does on the same devices. */
++static guint
++probe_passthrough (GstAudioTrackSink * self, JNIEnv * env)
++{
++  static const struct
++  {
++    gint encoding;
++    guint flag;
++    const gchar *name;
++  } codecs[] = {
++    {ENCODING_AC3, GST_ANDROID_AUDIO_PASSTHROUGH_AC3, "AC-3"},
++    {ENCODING_E_AC3, GST_ANDROID_AUDIO_PASSTHROUGH_EAC3, "E-AC-3"},
++    {ENCODING_DTS, GST_ANDROID_AUDIO_PASSTHROUGH_DTS, "DTS"},
++  };
++  GError *err = NULL;
++  jobject attributes;
++  guint supported = 0, i;
++
++  if (!jni.track_is_direct_playback_supported) {
++    GST_INFO_OBJECT (self, "API %d cannot report passthrough support, "
++        "offering all codecs", gst_android_audio_get_api_level ());
++    return GST_ANDROID_AUDIO_PASSTHROUGH_ALL;
++  }
++
++  attributes = build_attributes (env, &err);
++  if (!attributes) {
++    log_error (self, "AudioAttributes", &err);
++    return 0;
++  }
++
++  for (i = 0; i < G_N_ELEMENTS (codecs); i++) {
++    jobject format = build_format (env, &err, codecs[i].encoding, 48000,
++        CHANNEL_OUT_STEREO);
++    gboolean direct = FALSE;
++
++    if (!format) {
++      log_error (self, "AudioFormat", &err);
++      continue;
++    }
++
++    if (!gst_amc_jni_call_static_boolean_method (env, &err, jni.track,
++            jni.track_is_direct_playback_supported, &direct, format,
++            attributes))
++      log_error (self, "isDirectPlaybackSupported", &err);
++
++    GST_INFO_OBJECT (self, "%s passthrough %ssupported", codecs[i].name,
++        direct ? "" : "not ");
++    if (direct)
++      supported |= codecs[i].flag;
++
++    gst_amc_jni_object_local_unref (env, format);
++  }
++
++  gst_amc_jni_object_local_unref (env, attributes);
++  return supported;
++}
++
++static void
++job_open (GstAudioTrackSink * self, JNIEnv * env, gpointer data)
++{
++  gboolean *ret = data;
++  GError *err = NULL;
++  gboolean passthrough;
++  guint supported = 0;
++
++  if (!env || !init_jni (env, &err)) {
++    log_error (self, "JNI", &err);
++    *ret = FALSE;
++    return;
++  }
++
++  GST_OBJECT_LOCK (self);
++  passthrough = self->passthrough;
++  GST_OBJECT_UNLOCK (self);
++
++  if (passthrough)
++    supported = probe_passthrough (self, env);
++
++  GST_OBJECT_LOCK (self);
++  self->supported_passthrough = supported;
++  GST_OBJECT_UNLOCK (self);
++
++  *ret = TRUE;
++}
++
++static void
++reset_position (GstAudioTrackSink * self)
++{
++  self->head_position = 0;
++  self->frames_written = 0;
++
++  g_mutex_lock (&self->lock);
++  self->position_valid = FALSE;
++  self->position_playing = FALSE;
++  self->position_written = 0;
++  self->position_played = 0;
++  g_mutex_unlock (&self->lock);
++}
++
++static void
++job_release (GstAudioTrackSink * self, JNIEnv * env, gpointer data)
++{
++  GError *err = NULL;
++
++  if (self->track) {
++    if (!gst_amc_jni_call_void_method (env, &err, self->track,
++            jni.track_release))
++      log_error (self, "AudioTrack.release", &err);
++    gst_amc_jni_object_unref (env, self->track);
++    self->track = NULL;
++  }
++  if (self->timestamp) {
++    gst_amc_jni_object_unref (env, self->timestamp);
++    self->timestamp = NULL;
++  }
++  if (self->shorts) {
++    gst_amc_jni_object_unref (env, self->shorts);
++    self->shorts = NULL;
++    self->shorts_len = 0;
++  }
++
++  self->playing = FALSE;
++  reset_position (self);
++}
++
++static void
++job_create (GstAudioTrackSink * self, JNIEnv * env, gpointer data)
++{
++  gboolean *ret = data;
++  GError *err = NULL;
++  jobject attributes = NULL, format = NULL, builder = NULL, track = NULL;
++  gint min_size = 0, size, state = 0;
++
++  *ret = FALSE;
++
++  job_release (self, env, NULL);
++
++  if (!gst_amc_jni_call_static_int_method (env, &err, jni.track,
++          jni.track_get_min_buffer_size, &min_size, self->rate,
++          self->channel_mask, self->encoding) || min_size <= 0) {
++    GST_ERROR_OBJECT (self, "AudioTrack.getMinBufferSize (%d, 0x%x, %d) = %d",
++        self->rate, self->channel_mask, self->encoding, min_size);
++    g_clear_error (&err);
++    return;
++  }
++
++  /* At least 100 ms, in whole frames: the ring buffer upstream holds the
++   * rest. */
++  size = MAX (min_size, self->rate / 10 * self->device_bpf);
++  size = GST_ROUND_UP_N (size, self->device_bpf);
++
++  attributes = build_attributes (env, &err);
++  if (!attributes)
++    goto fail;
++  format = build_format (env, &err, self->encoding, self->rate,
++      self->channel_mask);
++  if (!format)
++    goto fail;
++
++  builder = gst_amc_jni_new_object (env, &err, FALSE, jni.track_builder,
++      jni.track_builder_ctor);
++  if (!builder)
++    goto fail;
++
++  if (!builder_set_object (env, &err, builder,
++          jni.track_builder_set_audio_attributes, attributes) ||
++      !builder_set_object (env, &err, builder,
++          jni.track_builder_set_audio_format, format) ||
++      !builder_set_int (env, &err, builder,
++          jni.track_builder_set_buffer_size, size) ||
++      !builder_set_int (env, &err, builder,
++          jni.track_builder_set_transfer_mode, MODE_STREAM))
++    goto fail;
++
++  /* Throws UnsupportedOperationException for a format the output refuses. */
++  if (!gst_amc_jni_call_object_method (env, &err, builder,
++          jni.track_builder_build, &track))
++    goto fail;
++
++  if (!gst_amc_jni_call_int_method (env, &err, track, jni.track_get_state,
++          &state) || state != STATE_INITIALIZED) {
++    GST_ERROR_OBJECT (self, "AudioTrack state %d", state);
++    gst_amc_jni_call_void_method (env, NULL, track, jni.track_release);
++    goto fail;
++  }
++
++  self->timestamp = gst_amc_jni_new_object (env, &err, TRUE, jni.timestamp,
++      jni.timestamp_ctor);
++  if (!self->timestamp) {
++    gst_amc_jni_call_void_method (env, NULL, track, jni.track_release);
++    goto fail;
++  }
++
++  self->track = gst_amc_jni_object_make_global (env, track);
++  track = NULL;
++
++  GST_INFO_OBJECT (self, "created AudioTrack: encoding %d, rate %d, "
++      "mask 0x%x, buffer %d bytes (min %d)", self->encoding, self->rate,
++      self->channel_mask, size, min_size);
++
++  *ret = TRUE;
++  goto done;
++
++fail:
++  GST_ERROR_OBJECT (self, "could not create an AudioTrack (encoding %d, "
++      "rate %d, mask 0x%x): %s", self->encoding, self->rate,
++      self->channel_mask, err ? err->message : "failed");
++  g_clear_error (&err);
++
++done:
++  if (track)
++    gst_amc_jni_object_local_unref (env, track);
++  if (builder)
++    gst_amc_jni_object_local_unref (env, builder);
++  if (format)
++    gst_amc_jni_object_local_unref (env, format);
++  if (attributes)
++    gst_amc_jni_object_local_unref (env, attributes);
++}
++
++/* Where playback is, from the presentation timestamp when there is a recent
++ * one, otherwise from the playback head. */
++static void
++update_position (GstAudioTrackSink * self, JNIEnv * env)
++{
++  GstClockTime now = monotonic_time ();
++  gboolean have_timestamp = FALSE;
++  gint64 played = 0;
++  gint head = 0;
++
++  if (gst_amc_jni_call_boolean_method (env, NULL, self->track,
++          jni.track_get_timestamp, &have_timestamp, self->timestamp) &&
++      have_timestamp) {
++    jlong position = (*env)->GetLongField (env, self->timestamp,
++        jni.timestamp_frame_position);
++    jlong time = (*env)->GetLongField (env, self->timestamp,
++        jni.timestamp_nano_time);
++
++    if (position > 0 && time <= now && now - time < TIMESTAMP_MAX_AGE)
++      played = position + gst_util_uint64_scale_int (now - time, self->rate,
++          GST_SECOND);
++    else
++      have_timestamp = FALSE;
++  }
++
++  if (!have_timestamp) {
++    if (!gst_amc_jni_call_int_method (env, NULL, self->track,
++            jni.track_get_playback_head_position, &head))
++      return;
++
++    /* A 32-bit unsigned count that wraps around. */
++    if ((guint32) head < (guint32) self->head_position)
++      self->head_position += G_GUINT64_CONSTANT (1) << 32;
++    self->head_position = (self->head_position & ~G_GUINT64_CONSTANT
++        (0xffffffff)) | (guint32) head;
++    played = self->head_position;
++  }
++
++  g_mutex_lock (&self->lock);
++  self->position_valid = TRUE;
++  self->position_playing = self->playing;
++  self->position_written = self->frames_written;
++  self->position_played = played;
++  self->position_time = now;
++  g_mutex_unlock (&self->lock);
++}
++
++static gboolean
++ring_buffer_started (GstAudioTrackSink * self)
++{
++  GstAudioRingBuffer *buf = GST_AUDIO_BASE_SINK (self)->ringbuffer;
++
++  return g_atomic_int_get (&buf->state) == GST_AUDIO_RING_BUFFER_STATE_STARTED;
++}
++
++typedef struct
++{
++  const guint8 *data;
++  gint length;
++  gint result;
++} WriteJob;
++
++/* Offers the data to the track without blocking, starting it first if
++ * needed. The ring buffer state is checked here, on the JNI thread, so that
++ * a pause queued behind this job cannot be undone by it. */
++static void
++job_write (GstAudioTrackSink * self, JNIEnv * env, gpointer data)
++{
++  WriteJob *job = data;
++  GError *err = NULL;
++  gint ret = 0;
++
++  job->result = 0;
++
++  if (!ring_buffer_started (self))
++    return;
++
++  if (!self->track) {
++    gboolean created;
++
++    job_create (self, env, &created);
++    if (!created) {
++      job->result = -1;
++      return;
++    }
++  }
++
++  if (!self->playing) {
++    if (!gst_amc_jni_call_void_method (env, &err, self->track,
++            jni.track_play)) {
++      log_error (self, "AudioTrack.play", &err);
++      job->result = -1;
++      return;
++    }
++    self->playing = TRUE;
++  }
++
++  if (self->iec61937) {
++    /* IEC 61937 is written as shorts, as mpv does. */
++    gint n = job->length / 2;
++
++    if (n > self->shorts_len) {
++      jshortArray array = (*env)->NewShortArray (env, n);
++
++      if (!array) {
++        (*env)->ExceptionClear (env);
++        job->result = -1;
++        return;
++      }
++      if (self->shorts)
++        gst_amc_jni_object_unref (env, self->shorts);
++      self->shorts = gst_amc_jni_object_make_global (env, array);
++      self->shorts_len = n;
++    }
++
++    (*env)->SetShortArrayRegion (env, self->shorts, 0, n,
++        (const jshort *) job->data);
++    if (gst_amc_jni_call_int_method (env, &err, self->track,
++            jni.track_write_shorts, &ret, self->shorts, 0, n,
++            WRITE_NON_BLOCKING) && ret > 0)
++      ret *= 2;
++  } else {
++    jobject buffer = (*env)->NewDirectByteBuffer (env, (void *) job->data,
++        job->length);
++
++    if (!buffer) {
++      (*env)->ExceptionClear (env);
++      job->result = -1;
++      return;
++    }
++    gst_amc_jni_call_int_method (env, &err, self->track,
++        jni.track_write_buffer, &ret, buffer, job->length, WRITE_NON_BLOCKING);
++    gst_amc_jni_object_local_unref (env, buffer);
++  }
++
++  if (err) {
++    log_error (self, "AudioTrack.write", &err);
++    job->result = -1;
++    return;
++  }
++
++  if (ret == ERROR_DEAD_OBJECT) {
++    /* The output went away (HDMI replugged, audioserver restarted). The
++     * next write creates a new track on the current route. */
++    GST_INFO_OBJECT (self, "AudioTrack is dead, recreating it");
++    job_release (self, env, NULL);
++    return;
++  } else if (ret < 0) {
++    GST_ERROR_OBJECT (self, "AudioTrack.write: %d", ret);
++    job->result = -1;
++    return;
++  }
++
++  self->frames_written += ret / self->device_bpf;
++  update_position (self, env);
++
++  job->result = ret;
++}
++
++static void
++job_pause (GstAudioTrackSink * self, JNIEnv * env, gpointer data)
++{
++  GError *err = NULL;
++
++  if (!self->track || !self->playing)
++    return;
++
++  if (!gst_amc_jni_call_void_method (env, &err, self->track, jni.track_pause))
++    log_error (self, "AudioTrack.pause", &err);
++  self->playing = FALSE;
++
++  g_mutex_lock (&self->lock);
++  self->position_playing = FALSE;
++  g_mutex_unlock (&self->lock);
++}
++
++static void
++job_stop (GstAudioTrackSink * self, JNIEnv * env, gpointer data)
++{
++  GError *err = NULL;
++
++  if (!self->track)
++    return;
++
++  job_pause (self, env, NULL);
++  if (!gst_amc_jni_call_void_method (env, &err, self->track, jni.track_flush))
++    log_error (self, "AudioTrack.flush", &err);
++
++  reset_position (self);
++}
++
++/* GstAudioSink */
++
++static gboolean
++gst_audio_track_sink_open (GstAudioSink * asink)
++{
++  GstAudioTrackSink *self = GST_AUDIO_TRACK_SINK (asink);
++  gboolean ret = FALSE;
++
++  if (!start_worker (self))
++    goto fail;
++
++  invoke (self, job_open, &ret);
++  if (!ret) {
++    stop_worker (self);
++    goto fail;
++  }
++
++  return TRUE;
++
++fail:
++  GST_ELEMENT_ERROR (self, RESOURCE, OPEN_WRITE, (NULL),
++      ("Could not initialize AudioTrack"));
++  return FALSE;
++}
++
++static gboolean
++gst_audio_track_sink_close (GstAudioSink * asink)
++{
++  GstAudioTrackSink *self = GST_AUDIO_TRACK_SINK (asink);
++
++  if (self->worker)
++    invoke (self, job_release, NULL);
++  stop_worker (self);
++
++  GST_OBJECT_LOCK (self);
++  self->supported_passthrough = 0;
++  GST_OBJECT_UNLOCK (self);
++
++  return TRUE;
++}
++
++static gboolean
++gst_audio_track_sink_prepare (GstAudioSink * asink,
++    GstAudioRingBufferSpec * spec)
++{
++  GstAudioTrackSink *self = GST_AUDIO_TRACK_SINK (asink);
++  gboolean ret = FALSE;
++
++  if (gst_android_audio_spec_is_passthrough (spec)) {
++    self->iec61937 = TRUE;
++    self->encoding = ENCODING_IEC61937;
++    self->rate = gst_android_audio_iec61937_rate (spec);
++    self->channel_mask = CHANNEL_OUT_STEREO;
++    self->device_bpf = 4;
++  } else {
++    guint32 mask;
++
++    switch (GST_AUDIO_INFO_FORMAT (&spec->info)) {
++      case GST_AUDIO_FORMAT_S16LE:
++        self->encoding = ENCODING_PCM_16BIT;
++        break;
++      case GST_AUDIO_FORMAT_F32LE:
++        self->encoding = ENCODING_PCM_FLOAT;
++        break;
++      case GST_AUDIO_FORMAT_S24LE:
++        self->encoding = ENCODING_PCM_24BIT_PACKED;
++        break;
++      case GST_AUDIO_FORMAT_S32LE:
++        self->encoding = ENCODING_PCM_32BIT;
++        break;
++      default:
++        GST_ERROR_OBJECT (self, "unsupported format %s",
++            GST_AUDIO_INFO_NAME (&spec->info));
++        return FALSE;
++    }
++
++    mask = gst_android_audio_channel_mask (&spec->info);
++    if (!mask) {
++      GST_ERROR_OBJECT (self, "unsupported layout");
++      return FALSE;
++    }
++
++    self->iec61937 = FALSE;
++    self->rate = GST_AUDIO_INFO_RATE (&spec->info);
++    self->channel_mask = GST_ANDROID_AUDIO_JAVA_CHANNEL_MASK (mask);
++    self->device_bpf = GST_AUDIO_INFO_BPF (&spec->info);
++  }
++  self->ring_bpf = GST_AUDIO_INFO_BPF (&spec->info);
++
++  invoke (self, job_create, &ret);
++  if (!ret)
++    GST_ELEMENT_ERROR (self, RESOURCE, OPEN_WRITE, (NULL),
++        ("Could not create an AudioTrack (encoding %d, rate %d, mask 0x%x)",
++            self->encoding, self->rate, self->channel_mask));
++
++  return ret;
++}
++
++static gboolean
++gst_audio_track_sink_unprepare (GstAudioSink * asink)
++{
++  GstAudioTrackSink *self = GST_AUDIO_TRACK_SINK (asink);
++
++  invoke (self, job_release, NULL);
++
++  return TRUE;
++}
++
++static gint
++gst_audio_track_sink_write (GstAudioSink * asink, gpointer data, guint length)
++{
++  GstAudioTrackSink *self = GST_AUDIO_TRACK_SINK (asink);
++  guint done = 0;
++
++  while (done < length) {
++    WriteJob job = { (const guint8 *) data + done, length - done, 0 };
++
++    if (!ring_buffer_started (self))
++      break;
++
++    invoke (self, job_write, &job);
++    if (job.result < 0) {
++      GST_ELEMENT_ERROR (self, RESOURCE, WRITE, (NULL),
++          ("Could not write to the AudioTrack"));
++      return -1;
++    }
++
++    if (job.result == 0)
++      g_usleep (FULL_WAIT_US);
++    done += job.result;
++  }
++
++  return done;
++}
++
++static guint
++gst_audio_track_sink_delay (GstAudioSink * asink)
++{
++  GstAudioTrackSink *self = GST_AUDIO_TRACK_SINK (asink);
++  gint64 played, delay = 0;
++
++  g_mutex_lock (&self->lock);
++  if (self->position_valid) {
++    played = self->position_played;
++    if (self->position_playing)
++      played += gst_util_uint64_scale_int (monotonic_time () -
++          self->position_time, self->rate, GST_SECOND);
++
++    delay = CLAMP (self->position_written - played, 0,
++        self->position_written);
++    /* In ring buffer frames. */
++    delay = delay * self->device_bpf / self->ring_bpf;
++  }
++  g_mutex_unlock (&self->lock);
++
++  return (guint) delay;
++}
++
++static void
++gst_audio_track_sink_pause (GstAudioSink * asink)
++{
++  GstAudioTrackSink *self = GST_AUDIO_TRACK_SINK (asink);
++
++  invoke (self, job_pause, NULL);
++}
++
++static void
++gst_audio_track_sink_stop (GstAudioSink * asink)
++{
++  GstAudioTrackSink *self = GST_AUDIO_TRACK_SINK (asink);
++
++  invoke (self, job_stop, NULL);
++}
++
++/* GstBaseSink */
++
++static GstCaps *
++gst_audio_track_sink_getcaps (GstBaseSink * bsink, GstCaps * filter)
++{
++  GstAudioTrackSink *self = GST_AUDIO_TRACK_SINK (bsink);
++  static const gchar *formats_31[] = { "F32LE", "S16LE", "S32LE", "S24LE",
++    NULL
++  };
++  static const gchar *formats_21[] = { "F32LE", "S16LE", NULL };
++  gboolean passthrough;
++  guint supported;
++  GstCaps *caps, *tmp;
++
++  GST_OBJECT_LOCK (self);
++  passthrough = self->passthrough;
++  supported = self->supported_passthrough;
++  GST_OBJECT_UNLOCK (self);
++
++  caps = gst_android_audio_pcm_caps (gst_android_audio_get_api_level () >= 31
++      ? formats_31 : formats_21, 8);
++
++  /* Only once open() has probed the output. */
++  if (passthrough && supported)
++    gst_caps_append (caps, gst_android_audio_passthrough_caps (supported));
++
++  if (filter) {
++    tmp = gst_caps_intersect_full (filter, caps, GST_CAPS_INTERSECT_FIRST);
++    gst_caps_unref (caps);
++    caps = tmp;
++  }
++
++  GST_LOG_OBJECT (self, "caps %" GST_PTR_FORMAT, caps);
++
++  return caps;
++}
++
++static gboolean
++gst_audio_track_sink_query (GstBaseSink * bsink, GstQuery * query)
++{
++  if (GST_QUERY_TYPE (query) == GST_QUERY_ACCEPT_CAPS) {
++    GstCaps *caps;
++
++    gst_query_parse_accept_caps (query, &caps);
++    gst_query_set_accept_caps_result (query,
++        gst_android_audio_accept_caps (GST_AUDIO_BASE_SINK (bsink), caps));
++    return TRUE;
++  }
++
++  return GST_BASE_SINK_CLASS (parent_class)->query (bsink, query);
++}
++
++/* GObject */
++
++static void
++gst_audio_track_sink_set_property (GObject * object, guint prop_id,
++    const GValue * value, GParamSpec * pspec)
++{
++  GstAudioTrackSink *self = GST_AUDIO_TRACK_SINK (object);
++
++  switch (prop_id) {
++    case PROP_PASSTHROUGH:
++      GST_OBJECT_LOCK (self);
++      self->passthrough = g_value_get_boolean (value);
++      GST_OBJECT_UNLOCK (self);
++      break;
++    default:
++      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
++      break;
++  }
++}
++
++static void
++gst_audio_track_sink_get_property (GObject * object, guint prop_id,
++    GValue * value, GParamSpec * pspec)
++{
++  GstAudioTrackSink *self = GST_AUDIO_TRACK_SINK (object);
++
++  switch (prop_id) {
++    case PROP_PASSTHROUGH:
++      GST_OBJECT_LOCK (self);
++      g_value_set_boolean (value, self->passthrough);
++      GST_OBJECT_UNLOCK (self);
++      break;
++    default:
++      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
++      break;
++  }
++}
++
++static void
++gst_audio_track_sink_finalize (GObject * object)
++{
++  GstAudioTrackSink *self = GST_AUDIO_TRACK_SINK (object);
++
++  g_mutex_clear (&self->job_lock);
++  g_cond_clear (&self->job_cond);
++  g_mutex_clear (&self->lock);
++
++  G_OBJECT_CLASS (parent_class)->finalize (object);
++}
++
++static void
++gst_audio_track_sink_class_init (GstAudioTrackSinkClass * klass)
++{
++  GObjectClass *gobject_class = G_OBJECT_CLASS (klass);
++  GstElementClass *element_class = GST_ELEMENT_CLASS (klass);
++  GstBaseSinkClass *basesink_class = GST_BASE_SINK_CLASS (klass);
++  GstAudioBaseSinkClass *audiobasesink_class = GST_AUDIO_BASE_SINK_CLASS (klass);
++  GstAudioSinkClass *audiosink_class = GST_AUDIO_SINK_CLASS (klass);
++
++  gobject_class->set_property = gst_audio_track_sink_set_property;
++  gobject_class->get_property = gst_audio_track_sink_get_property;
++  gobject_class->finalize = gst_audio_track_sink_finalize;
++
++  /**
++   * GstAudioTrackSink:passthrough:
++   *
++   * Offer the AC-3, E-AC-3 and DTS caps the output supports and send them
++   * as IEC 61937. Read when the element goes to READY, which is when the
++   * output is probed.
++   */
++  g_object_class_install_property (gobject_class, PROP_PASSTHROUGH,
++      g_param_spec_boolean ("passthrough", "Passthrough",
++          "Offer AC-3, E-AC-3 and DTS for IEC 61937 passthrough",
++          DEFAULT_PASSTHROUGH, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
++
++  gst_element_class_add_static_pad_template (element_class, &sink_template);
++  gst_element_class_set_static_metadata (element_class, "AudioTrack Sink",
++      "Sink/Audio", "Output audio through android.media.AudioTrack",
++      "BuzzTV <max@buzztv.com>");
++
++  basesink_class->get_caps = GST_DEBUG_FUNCPTR (gst_audio_track_sink_getcaps);
++  basesink_class->query = GST_DEBUG_FUNCPTR (gst_audio_track_sink_query);
++
++  audiobasesink_class->payload = GST_DEBUG_FUNCPTR (gst_android_audio_payload);
++
++  audiosink_class->open = GST_DEBUG_FUNCPTR (gst_audio_track_sink_open);
++  audiosink_class->prepare = GST_DEBUG_FUNCPTR (gst_audio_track_sink_prepare);
++  audiosink_class->unprepare =
++      GST_DEBUG_FUNCPTR (gst_audio_track_sink_unprepare);
++  audiosink_class->close = GST_DEBUG_FUNCPTR (gst_audio_track_sink_close);
++  audiosink_class->write = GST_DEBUG_FUNCPTR (gst_audio_track_sink_write);
++  audiosink_class->delay = GST_DEBUG_FUNCPTR (gst_audio_track_sink_delay);
++  audiosink_class->pause = GST_DEBUG_FUNCPTR (gst_audio_track_sink_pause);
++  audiosink_class->stop = GST_DEBUG_FUNCPTR (gst_audio_track_sink_stop);
++}
++
++static void
++gst_audio_track_sink_init (GstAudioTrackSink * self)
++{
++  g_mutex_init (&self->job_lock);
++  g_cond_init (&self->job_cond);
++  g_mutex_init (&self->lock);
++  self->passthrough = DEFAULT_PASSTHROUGH;
++}
++
++gboolean
++gst_audio_track_sink_register (GstPlugin * plugin)
++{
++  GST_DEBUG_CATEGORY_INIT (audio_track_sink_debug, "audiotracksink", 0,
++      "AudioTrack sink");
++
++  /* AudioTrack.Builder */
++  if (gst_android_audio_get_api_level () < 23)
++    return FALSE;
++
++  return gst_element_register (plugin, "audiotracksink", GST_RANK_NONE,
++      GST_TYPE_AUDIO_TRACK_SINK);
++}
+diff --git a/subprojects/gst-plugins-bad/sys/androidmedia/gstaudiotracksink.h b/subprojects/gst-plugins-bad/sys/androidmedia/gstaudiotracksink.h
+new file mode 100644
+index 0000000000..573be87d42
+--- /dev/null
++++ b/subprojects/gst-plugins-bad/sys/androidmedia/gstaudiotracksink.h
+@@ -0,0 +1,36 @@
++/*
++ * Copyright (C) 2026 BuzzTV
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Library General Public
++ * License as published by the Free Software Foundation; either
++ * version 2 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Library General Public License for more details.
++ *
++ * You should have received a copy of the GNU Library General Public
++ * License along with this library; if not, write to the
++ * Free Software Foundation, Inc., 51 Franklin St, Fifth Floor,
++ * Boston, MA 02110-1301, USA.
++ */
++
++#ifndef __GST_AUDIO_TRACK_SINK_H__
++#define __GST_AUDIO_TRACK_SINK_H__
++
++#include <gst/gst.h>
++#include <gst/audio/audio.h>
++
++G_BEGIN_DECLS
++
++#define GST_TYPE_AUDIO_TRACK_SINK (gst_audio_track_sink_get_type ())
++G_DECLARE_FINAL_TYPE (GstAudioTrackSink, gst_audio_track_sink, GST,
++    AUDIO_TRACK_SINK, GstAudioSink)
++
++gboolean gst_audio_track_sink_register (GstPlugin * plugin);
++
++G_END_DECLS
++
++#endif /* __GST_AUDIO_TRACK_SINK_H__ */
+diff --git a/subprojects/gst-plugins-bad/sys/androidmedia/meson.build b/subprojects/gst-plugins-bad/sys/androidmedia/meson.build
+index 9221315876..2ac430cfd4 100644
+--- a/subprojects/gst-plugins-bad/sys/androidmedia/meson.build
++++ b/subprojects/gst-plugins-bad/sys/androidmedia/meson.build
+@@ -1,4 +1,5 @@
+ androidmedia_sources = [
++  'gstaaudiosink.c',
+   'gstamcaudiodec.c',
+   'gstamc.c',
+   'gstamcutils.c',
+@@ -12,6 +13,8 @@ androidmedia_sources = [
+   'gst-android-graphics-imageformat.c',
+   'gst-android-hardware-camera.c',
+   'gst-android-hardware-sensor.c',
++  'gstandroidaudio.c',
++  'gstaudiotracksink.c',
+   'gstjniutils.c',
+   'jni/gstamc-jni.c',
+   'jni/gstamc-codec-jni.c',
+@@ -27,6 +30,7 @@ ndk_sources = [
+ ]
+ 
+ androidmedia_headers = [
++  'gstaaudiosink.h',
+   'gstahcsrc.h',
+   'gstahssrc.h',
+   'gstamcaudiodec.h',
+@@ -42,6 +46,8 @@ androidmedia_headers = [
+   'gst-android-graphics-imageformat.h',
+   'gst-android-hardware-camera.h',
+   'gst-android-hardware-sensor.h',
++  'gstandroidaudio.h',
++  'gstaudiotracksink.h',
+   'gstjniutils.h',
+   'gstsensors.h',
+ ]
+-- 
+2.55.0
+
