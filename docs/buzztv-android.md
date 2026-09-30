@@ -231,8 +231,8 @@ Like `openslessink`, both implement `GstStreamVolume`: `volume` (0.0-1.0) and
 unfocused Multi Screen tiles depends on it. `audiotracksink` applies it with
 `AudioTrack.setVolume()`. AAudio has no volume control, so `aaudiosink` scales
 the PCM itself, and a change reaches the output after what the device has
-already buffered. A bitstream can't be scaled, so on passthrough `volume` has
-no effect and `mute` sends silence.
+already buffered. A bitstream can't be scaled, so on passthrough both sinks
+send silence on `mute` or at `volume` 0, and any other volume has no effect.
 
 | | `aaudiosink` | `audiotracksink` |
 | --- | --- | --- |
@@ -286,10 +286,16 @@ through on the p6 (libmpv-android-video-build PR #5).
 Which passthrough codecs each sink offers:
 
 * `audiotracksink`, API 29+: the ones `AudioTrack.isDirectPlaybackSupported()`
-  reports for the current output, probed at NULL→READY. That reflects what the
-  HDMI sink (the AV receiver's EDID) accepts. It asks about `ENCODING_AC3` /
-  `E_AC3` / `DTS` and then sends IEC 61937 regardless, as mpv does on these
-  boxes.
+  reports for the current output. That reflects what the HDMI sink (the TV's or
+  AV receiver's EDID) accepts. It asks about `ENCODING_AC3` / `E_AC3` / `DTS`
+  and then sends IEC 61937 regardless, as mpv does on these boxes. The probe
+  runs at NULL→READY, or when `passthrough` is turned on after that. Before
+  the probe the sink offers all three, so `ac3parse ! audiotracksink
+  passthrough=true` links in NULL like any other pipeline. After it, a codec
+  the output doesn't take fails negotiation. To learn the supported set before
+  building the pipeline, take a spare sink with `passthrough=true` to READY and
+  query its pad caps. Changing `passthrough` sends a reconfigure event
+  upstream, so an already negotiated upstream can renegotiate.
 * `audiotracksink`, API 24-28: all three. A track the output can't take fails
   to open, and the pipeline errors out.
 * `aaudiosink`, API 34+: all three. AAudio has no capability query, so set
@@ -308,6 +314,33 @@ write without blocking (AAudio with a 10 ms timeout, AudioTrack with
 or flush never waits on a full device buffer. Both reopen the stream or track
 when the output goes away (`AAUDIO_ERROR_DISCONNECTED`, `ERROR_DEAD_OBJECT`),
 e.g. on HDMI replug.
+
+**Position.** `audiotracksink` counts the position in device frames, at the IEC
+61937 rate for passthrough (192 kHz for E-AC-3). It takes it from
+`AudioTrack.getTimestamp()`, extrapolated from the last answer while that is
+under 2 s old, and otherwise from `getPlaybackHeadPosition()`.
+`getTimestamp()` is never polled on every write, because each poll is a HAL
+call. It's polled every 500 ms once it has answered since the last `play()`,
+and every 50 ms before that, for at most 2 s. After ten polls in a row with
+no usable answer, the sink asks only every 10 s, across seeks and pauses,
+until one of those polls answers or the track is released. The count is kept
+per track, and the sink creates a new track on every format change and every
+READY→PAUSED. A timestamp from before the last `play()` is ignored, so a
+resume can't run ahead by the length of the pause. The position never passes
+what has been written, and backward steps under 20 ms are held off: AudioTrack
+corrects its timestamps back by a few milliseconds now and then. A larger step
+back is taken as a real correction. A playback-head step back counts as a
+32-bit wrap only when it actually crosses 2^32 and stays within what has been
+written, and a stray 0 read is ignored.
+
+On the p6 the `hdmi_bitstream` port can't report a position for the first few
+seconds of a passthrough start. The audio HAL process
+(`android.hardware.audio.service`) then logs `get_presentation_position:
+Operation not permitted` about 100 times a second for about 3.3 s, some 330
+lines per start. The sink polls at most every 50 ms and backs off once polls
+go unanswered, so nearly all of those come from Android's audio server itself
+and can't be avoided from here. Once the stream is running the port answers,
+and steady playback logs none.
 
 `ci/buzztv/required-elements.txt` makes CI refuse to publish a tarball whose
 `libgstandroidmedia.a` lacks either element, so a patch that stops applying

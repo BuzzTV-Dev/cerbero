@@ -1,4 +1,4 @@
-From f3d4bcbd095c862cf78238d5b6649cb8868541aa Mon Sep 17 00:00:00 2001
+From 4e6eaa77ce4aca684037d267bdf85ab557b0752f Mon Sep 17 00:00:00 2001
 From: Maksym Vasylchuk <max@buzztv.com>
 Date: Tue, 29 Sep 2026 19:19:51 +0300
 Subject: [PATCH] androidmedia: Add aaudiosink and audiotracksink
@@ -7,21 +7,24 @@ openslessink tops out at stereo S16. aaudiosink plays PCM up to 7.1
 through AAudio (channel masks need API 32) and IEC 61937 from API 34.
 audiotracksink plays the same PCM through AudioTrack, plus AC-3, E-AC-3
 and DTS as IEC 61937 from API 24, offering only what
-isDirectPlaybackSupported() reports from API 29 on.
+isDirectPlaybackSupported() reports from API 29 on. Until the output has
+been probed it offers all three, so a parser links to it in NULL.
 
-audiotracksink makes every JNI call on one thread it owns.
+audiotracksink makes every JNI call on one thread it owns, and polls
+getTimestamp() every 500 ms rather than on every write, backing off to
+the playback head on outputs that never answer.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- .../sys/androidmedia/gstaaudiosink.c          |  872 +++++++++++
+ .../sys/androidmedia/gstaaudiosink.c          |  873 ++++++++++
  .../sys/androidmedia/gstaaudiosink.h          |   36 +
  .../gst-plugins-bad/sys/androidmedia/gstamc.c |   10 +
  .../sys/androidmedia/gstandroidaudio.c        |  290 ++++
  .../sys/androidmedia/gstandroidaudio.h        |   68 +
- .../sys/androidmedia/gstaudiotracksink.c      | 1323 +++++++++++++++++
+ .../sys/androidmedia/gstaudiotracksink.c      | 1501 +++++++++++++++++
  .../sys/androidmedia/gstaudiotracksink.h      |   36 +
  .../sys/androidmedia/meson.build              |    6 +
- 8 files changed, 2641 insertions(+)
+ 8 files changed, 2820 insertions(+)
  create mode 100644 subprojects/gst-plugins-bad/sys/androidmedia/gstaaudiosink.c
  create mode 100644 subprojects/gst-plugins-bad/sys/androidmedia/gstaaudiosink.h
  create mode 100644 subprojects/gst-plugins-bad/sys/androidmedia/gstandroidaudio.c
@@ -31,10 +34,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 
 diff --git a/subprojects/gst-plugins-bad/sys/androidmedia/gstaaudiosink.c b/subprojects/gst-plugins-bad/sys/androidmedia/gstaaudiosink.c
 new file mode 100644
-index 0000000000..39a237b62f
+index 0000000000..0022420f60
 --- /dev/null
 +++ b/subprojects/gst-plugins-bad/sys/androidmedia/gstaaudiosink.c
-@@ -0,0 +1,872 @@
+@@ -0,0 +1,873 @@
 +/*
 + * Copyright (C) 2026 BuzzTV
 + *
@@ -779,8 +782,9 @@ index 0000000000..39a237b62f
 +          "Offer AC-3, E-AC-3 and DTS for IEC 61937 passthrough (API 34+)",
 +          DEFAULT_PASSTHROUGH, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 +
-+  /* GstStreamVolume, as openslessink has. It does not apply to passthrough,
-+   * where mute sends silence instead. */
++  /* GstStreamVolume, as openslessink has. A bitstream can't be scaled, so on
++   * passthrough mute and volume 0 send silence and any other volume has no
++   * effect. */
 +  g_object_class_install_property (gobject_class, PROP_VOLUME,
 +      g_param_spec_double ("volume", "Volume", "Volume of this stream",
 +          0.0, 1.0, DEFAULT_VOLUME,
@@ -1351,10 +1355,10 @@ index 0000000000..c22c09fd9a
 +#endif /* __GST_ANDROID_AUDIO_H__ */
 diff --git a/subprojects/gst-plugins-bad/sys/androidmedia/gstaudiotracksink.c b/subprojects/gst-plugins-bad/sys/androidmedia/gstaudiotracksink.c
 new file mode 100644
-index 0000000000..b69c644cc0
+index 0000000000..defa52a982
 --- /dev/null
 +++ b/subprojects/gst-plugins-bad/sys/androidmedia/gstaudiotracksink.c
-@@ -0,0 +1,1323 @@
+@@ -0,0 +1,1501 @@
 +/*
 + * Copyright (C) 2026 BuzzTV
 + *
@@ -1383,10 +1387,11 @@ index 0000000000..b69c644cc0
 + * Plays PCM in the layouts Android opens, mono to 7.1 (see the pad
 + * template). With #GstAudioTrackSink:passthrough set it also takes parsed
 + * AC-3, E-AC-3 and DTS and sends them as IEC 61937
-+ * (AudioFormat.ENCODING_IEC61937) for an external decoder. From API 29 only
-+ * the codecs AudioTrack.isDirectPlaybackSupported() reports for the current
-+ * output are offered; before that all three are, and a track the output
-+ * cannot take fails to open.
++ * (AudioFormat.ENCODING_IEC61937) for an external decoder. From API 29,
++ * once the output has been probed (at NULL to READY, or when passthrough is
++ * set later), only the codecs AudioTrack.isDirectPlaybackSupported() reports
++ * for it are offered. Until then, and on older releases, all three are, and
++ * a track the output cannot take fails to open.
 + *
 + * Every JNI call is made on one thread the element owns, never on the
 + * threads that change its state, so no thread the application created is
@@ -1431,7 +1436,26 @@ index 0000000000..b69c644cc0
 +/* How long the writer waits before offering data again to a full track. */
 +#define FULL_WAIT_US 5000
 +/* A timestamp older than this is not extrapolated from. */
-+#define TIMESTAMP_MAX_AGE (GST_SECOND)
++#define TIMESTAMP_MAX_AGE (2 * GST_SECOND)
++/* getTimestamp() is asked this often once it has answered since the last
++ * play(), and every TIMESTAMP_FAST_POLL_INTERVAL until then for up to
++ * TIMESTAMP_STARTUP; between polls the position is extrapolated from the
++ * last answer. Asking on every write costs a HAL call each time, and a
++ * direct output that cannot report a presentation position yet (the p6's
++ * HDMI bitstream port for its first few seconds) logs an error for every
++ * one. */
++#define TIMESTAMP_POLL_INTERVAL (500 * GST_MSECOND)
++#define TIMESTAMP_FAST_POLL_INTERVAL (50 * GST_MSECOND)
++/* How long after play() an unusable answer is expected and fast polling
++ * goes on. After it an unusable answer counts as no answer. */
++#define TIMESTAMP_STARTUP (2 * GST_SECOND)
++/* After this many unanswered polls in a row, counted per track, it is only
++ * asked every TIMESTAMP_RETRY_INTERVAL. */
++#define TIMESTAMP_MAX_FAILURES 10
++#define TIMESTAMP_RETRY_INTERVAL (10 * GST_SECOND)
++/* Backward steps of the position smaller than this are held off; larger
++ * ones are a correction and are taken. */
++#define MAX_HELD_BACKWARD_STEP (20 * GST_MSECOND)
 +
 +static struct
 +{
@@ -1474,6 +1498,9 @@ index 0000000000..b69c644cc0
 +
 +  /* with the object lock */
 +  gboolean passthrough;
++  /* Whether supported_passthrough holds a probe of the current output. Until
++   * it does, getcaps() offers every passthrough codec. */
++  gboolean passthrough_probed;
 +  guint supported_passthrough;
 +  gdouble volume;
 +  gboolean mute;
@@ -1496,6 +1523,17 @@ index 0000000000..b69c644cc0
 +  gboolean playing;
 +  guint64 head_position;
 +  gint64 frames_written;
++  /* When play() last started the track. */
++  GstClockTime play_time;
++  /* The last getTimestamp() answer accepted since play(), if any, and when
++   * to ask again. */
++  gboolean timestamp_valid;
++  gint64 timestamp_position;
++  GstClockTime timestamp_time;
++  GstClockTime timestamp_next_poll;
++  guint timestamp_failures;
++  /* See update_position(). */
++  gint64 last_played;
 +
 +  /* Set in prepare(), before the track exists. */
 +  gint encoding;
@@ -1558,6 +1596,8 @@ index 0000000000..b69c644cc0
 +        "rate = (int) { 32000, 44100, 48000 }"));
 +
 +static void gst_audio_track_sink_volume_changed (GstAudioTrackSink * self);
++static void gst_audio_track_sink_passthrough_changed (GstAudioTrackSink *
++    self);
 +
 +#define gst_audio_track_sink_parent_class parent_class
 +G_DEFINE_TYPE_WITH_CODE (GstAudioTrackSink, gst_audio_track_sink, GST_TYPE_AUDIO_SINK,
@@ -1896,12 +1936,31 @@ index 0000000000..b69c644cc0
 +}
 +
 +static void
++job_probe (GstAudioTrackSink * self, JNIEnv * env, gpointer data)
++{
++  GError *err = NULL;
++  guint supported;
++
++  /* A property change can queue this ahead of job_open(). */
++  if (!env || !init_jni (env, &err)) {
++    log_error (self, "JNI", &err);
++    return;
++  }
++
++  supported = probe_passthrough (self, env);
++
++  GST_OBJECT_LOCK (self);
++  self->supported_passthrough = supported;
++  self->passthrough_probed = TRUE;
++  GST_OBJECT_UNLOCK (self);
++}
++
++static void
 +job_open (GstAudioTrackSink * self, JNIEnv * env, gpointer data)
 +{
 +  gboolean *ret = data;
 +  GError *err = NULL;
 +  gboolean passthrough;
-+  guint supported = 0;
 +
 +  if (!env || !init_jni (env, &err)) {
 +    log_error (self, "JNI", &err);
@@ -1914,11 +1973,7 @@ index 0000000000..b69c644cc0
 +  GST_OBJECT_UNLOCK (self);
 +
 +  if (passthrough)
-+    supported = probe_passthrough (self, env);
-+
-+  GST_OBJECT_LOCK (self);
-+  self->supported_passthrough = supported;
-+  GST_OBJECT_UNLOCK (self);
++    job_probe (self, env, NULL);
 +
 +  *ret = TRUE;
 +}
@@ -1928,6 +1983,12 @@ index 0000000000..b69c644cc0
 +{
 +  self->head_position = 0;
 +  self->frames_written = 0;
++  self->play_time = 0;
++  self->timestamp_valid = FALSE;
++  /* An output that does not answer keeps its back-off across seeks. */
++  if (self->timestamp_failures < TIMESTAMP_MAX_FAILURES)
++    self->timestamp_next_poll = 0;
++  self->last_played = 0;
 +
 +  g_mutex_lock (&self->lock);
 +  self->position_valid = FALSE;
@@ -1960,11 +2021,13 @@ index 0000000000..b69c644cc0
 +  }
 +
 +  self->playing = FALSE;
++  /* A new track may be on another route: ask it afresh. */
++  self->timestamp_failures = 0;
 +  reset_position (self);
 +}
 +
 +/* Mute is setVolume (0) for PCM. A passthrough track ignores the volume;
-+ * job_write() sends silence for it instead. */
++ * job_write() sends silence for it instead, on mute or at volume 0. */
 +static void
 +job_apply_volume (GstAudioTrackSink * self, JNIEnv * env, gpointer data)
 +{
@@ -2080,43 +2143,127 @@ index 0000000000..b69c644cc0
 +    gst_amc_jni_object_local_unref (env, attributes);
 +}
 +
-+/* Where playback is, from the presentation timestamp when there is a recent
-+ * one, otherwise from the playback head. */
-+static void
-+update_position (GstAudioTrackSink * self, JNIEnv * env)
++/* Reads the playback head into head_position. */
++static gboolean
++read_head (GstAudioTrackSink * self, JNIEnv * env)
 +{
-+  GstClockTime now = monotonic_time ();
-+  gboolean have_timestamp = FALSE;
-+  gint64 played = 0;
++  guint64 high = self->head_position & ~G_GUINT64_CONSTANT (0xffffffff);
 +  gint head = 0;
 +
++  if (!gst_amc_jni_call_int_method (env, NULL, self->track,
++          jni.track_get_playback_head_position, &head))
++    return FALSE;
++
++  /* A failed read of a direct track's render position is reported as 0. */
++  if (head == 0 && self->head_position > 0)
++    return FALSE;
++
++  /* A 32-bit unsigned count that wraps around, and can't pass what has been
++   * written. Any other step back (a stale value just after a flush) is taken
++   * as it is. */
++  if ((guint32) self->head_position > 0xc0000000 &&
++      (guint32) head < 0x40000000 &&
++      high + (G_GUINT64_CONSTANT (1) << 32) + (guint32) head <=
++      (guint64) self->frames_written)
++    high += G_GUINT64_CONSTANT (1) << 32;
++  self->head_position = high | (guint32) head;
++
++  return TRUE;
++}
++
++/* Asks getTimestamp() when a poll is due. An unanswered poll keeps the
++ * previous answer, which update_position() uses for as long as it is fresh. */
++static void
++poll_timestamp (GstAudioTrackSink * self, JNIEnv * env, GstClockTime now)
++{
++  gboolean answered = FALSE, have_timestamp = FALSE;
++
++  if (now < self->timestamp_next_poll)
++    return;
++
++  /* Also when timestamps answer, so that no wrap of the head goes unseen. */
++  read_head (self, env);
++
 +  if (gst_amc_jni_call_boolean_method (env, NULL, self->track,
-+          jni.track_get_timestamp, &have_timestamp, self->timestamp) &&
-+      have_timestamp) {
++          jni.track_get_timestamp, &answered, self->timestamp) && answered) {
 +    jlong position = (*env)->GetLongField (env, self->timestamp,
 +        jni.timestamp_frame_position);
 +    jlong time = (*env)->GetLongField (env, self->timestamp,
 +        jni.timestamp_nano_time);
 +
-+    if (position > 0 && time <= now && now - time < TIMESTAMP_MAX_AGE)
-+      played = position + gst_util_uint64_scale_int (now - time, self->rate,
-+          GST_SECOND);
-+    else
-+      have_timestamp = FALSE;
++    /* Before the first frame is presented the answer is position 0, and
++     * just after a resume it can still be the one from before the pause,
++     * which extrapolated across the pause would run ahead by its length.
++     * The answer can be timestamped during the call, hence the fresh
++     * clock. */
++    have_timestamp = position > 0 && time > 0 &&
++        (GstClockTime) time <= monotonic_time () &&
++        (GstClockTime) time >= self->play_time;
++    if (have_timestamp) {
++      self->timestamp_position = position;
++      self->timestamp_time = time;
++    }
 +  }
 +
-+  if (!have_timestamp) {
-+    if (!gst_amc_jni_call_int_method (env, NULL, self->track,
-+            jni.track_get_playback_head_position, &head))
-+      return;
++  if (have_timestamp) {
++    if (self->timestamp_failures >= TIMESTAMP_MAX_FAILURES)
++      GST_INFO_OBJECT (self, "getTimestamp() answers again");
++    self->timestamp_failures = 0;
++    self->timestamp_valid = TRUE;
++    self->timestamp_next_poll = now + TIMESTAMP_POLL_INTERVAL;
++  } else {
++    gboolean startup = now < self->play_time + TIMESTAMP_STARTUP;
 +
-+    /* A 32-bit unsigned count that wraps around. */
-+    if ((guint32) head < (guint32) self->head_position)
-+      self->head_position += G_GUINT64_CONSTANT (1) << 32;
-+    self->head_position = (self->head_position & ~G_GUINT64_CONSTANT
-+        (0xffffffff)) | (guint32) head;
++    /* A stale or zero answer is normal just after play() on an output that
++     * does answer, so only no answer counts then. */
++    if ((!answered || !startup) &&
++        self->timestamp_failures < TIMESTAMP_MAX_FAILURES &&
++        ++self->timestamp_failures == TIMESTAMP_MAX_FAILURES)
++      GST_INFO_OBJECT (self, "getTimestamp() does not answer on this output, "
++          "asking every %" GST_TIME_FORMAT, GST_TIME_ARGS
++          (TIMESTAMP_RETRY_INTERVAL));
++    if (self->timestamp_failures >= TIMESTAMP_MAX_FAILURES)
++      self->timestamp_next_poll = now + TIMESTAMP_RETRY_INTERVAL;
++    else if (self->timestamp_valid || !startup)
++      self->timestamp_next_poll = now + TIMESTAMP_POLL_INTERVAL;
++    else
++      self->timestamp_next_poll = now + TIMESTAMP_FAST_POLL_INTERVAL;
++  }
++}
++
++/* Where playback is: extrapolated from the last presentation timestamp while
++ * it is fresh, otherwise the playback head. */
++static void
++update_position (GstAudioTrackSink * self, JNIEnv * env)
++{
++  GstClockTime now = monotonic_time (), age;
++  gint64 played, held;
++
++  poll_timestamp (self, env, now);
++
++  /* The answer can be a little younger than @now, which was read first. */
++  age = now > self->timestamp_time ? now - self->timestamp_time : 0;
++  if (self->timestamp_valid && age < TIMESTAMP_MAX_AGE) {
++    played = self->timestamp_position + gst_util_uint64_scale_int (age,
++        self->rate, GST_SECOND);
++  } else {
++    if (!read_head (self, env))
++      return;
 +    played = self->head_position;
 +  }
++
++  /* Extrapolation runs ahead of a track that has stopped advancing. */
++  played = MIN (played, self->frames_written);
++
++  /* AudioTrack corrects its timestamps backwards by a few milliseconds now
++   * and then ("retrograde timestamp position corrected"), and the playback
++   * head and an extrapolated timestamp need not agree. delay() should not
++   * grow for either; a larger step back is a real correction. */
++  held = gst_util_uint64_scale_int (MAX_HELD_BACKWARD_STEP, self->rate,
++      GST_SECOND);
++  if (played < self->last_played && self->last_played - played < held)
++    played = self->last_played;
++  self->last_played = played;
 +
 +  g_mutex_lock (&self->lock);
 +  self->position_valid = TRUE;
@@ -2175,6 +2322,7 @@ index 0000000000..b69c644cc0
 +      return;
 +    }
 +    self->playing = TRUE;
++    self->play_time = monotonic_time ();
 +  }
 +
 +  if (self->iec61937) {
@@ -2197,7 +2345,7 @@ index 0000000000..b69c644cc0
 +    }
 +
 +    GST_OBJECT_LOCK (self);
-+    muted = self->mute;
++    muted = self->mute || self->volume <= 0.0;
 +    GST_OBJECT_UNLOCK (self);
 +    if (muted && n > self->zeros_len) {
 +      g_free (self->zeros);
@@ -2260,6 +2408,10 @@ index 0000000000..b69c644cc0
 +  if (!gst_amc_jni_call_void_method (env, &err, self->track, jni.track_pause))
 +    log_error (self, "AudioTrack.pause", &err);
 +  self->playing = FALSE;
++  /* The timestamp stops with the track; ask again once it plays. */
++  self->timestamp_valid = FALSE;
++  if (self->timestamp_failures < TIMESTAMP_MAX_FAILURES)
++    self->timestamp_next_poll = 0;
 +
 +  g_mutex_lock (&self->lock);
 +  self->position_playing = FALSE;
@@ -2317,6 +2469,7 @@ index 0000000000..b69c644cc0
 +
 +  GST_OBJECT_LOCK (self);
 +  self->supported_passthrough = 0;
++  self->passthrough_probed = FALSE;
 +  GST_OBJECT_UNLOCK (self);
 +
 +  return TRUE;
@@ -2465,6 +2618,17 @@ index 0000000000..b69c644cc0
 +  g_mutex_unlock (&self->worker_lock);
 +}
 +
++/* From any thread; must not be called with the object lock held. Before
++ * open() there is no JNI thread, and open() probes itself. */
++static void
++gst_audio_track_sink_passthrough_changed (GstAudioTrackSink * self)
++{
++  g_mutex_lock (&self->worker_lock);
++  if (self->worker)
++    invoke (self, job_probe, NULL);
++  g_mutex_unlock (&self->worker_lock);
++}
++
 +/* GstBaseSink */
 +
 +static GstCaps *
@@ -2481,13 +2645,17 @@ index 0000000000..b69c644cc0
 +
 +  GST_OBJECT_LOCK (self);
 +  passthrough = self->passthrough;
-+  supported = self->supported_passthrough;
++  supported = self->passthrough_probed ? self->supported_passthrough :
++      GST_ANDROID_AUDIO_PASSTHROUGH_ALL;
 +  GST_OBJECT_UNLOCK (self);
 +
 +  caps = gst_android_audio_pcm_caps (gst_android_audio_get_api_level () >= 31
 +      ? formats_31 : formats_21, 8);
 +
-+  /* Only once open() has probed the output. */
++  /* Every codec until the output has been probed, so that a parser can be
++   * linked to the sink while it is still in NULL; the probed ones after. A
++   * codec the output turns out not to take then fails the caps query at
++   * negotiation, as any unsupported caps would. */
 +  if (passthrough && supported)
 +    gst_caps_append (caps, gst_android_audio_passthrough_caps (supported));
 +
@@ -2526,11 +2694,23 @@ index 0000000000..b69c644cc0
 +  GstAudioTrackSink *self = GST_AUDIO_TRACK_SINK (object);
 +
 +  switch (prop_id) {
-+    case PROP_PASSTHROUGH:
++    case PROP_PASSTHROUGH:{
++      gboolean passthrough = g_value_get_boolean (value), changed, probe;
++
 +      GST_OBJECT_LOCK (self);
-+      self->passthrough = g_value_get_boolean (value);
++      changed = self->passthrough != passthrough;
++      self->passthrough = passthrough;
++      probe = passthrough && !self->passthrough_probed;
 +      GST_OBJECT_UNLOCK (self);
++      /* Set after open(): probe now, on the JNI thread. */
++      if (probe)
++        gst_audio_track_sink_passthrough_changed (self);
++      /* The caps changed: let upstream renegotiate if it already has. */
++      if (changed)
++        gst_pad_push_event (GST_BASE_SINK_PAD (self),
++            gst_event_new_reconfigure ());
 +      break;
++    }
 +    case PROP_VOLUME:
 +      GST_OBJECT_LOCK (self);
 +      self->volume = g_value_get_double (value);
@@ -2608,16 +2788,18 @@ index 0000000000..b69c644cc0
 +   * GstAudioTrackSink:passthrough:
 +   *
 +   * Offer the AC-3, E-AC-3 and DTS caps the output supports and send them
-+   * as IEC 61937. Read when the element goes to READY, which is when the
-+   * output is probed.
++   * as IEC 61937. The output is probed when the element goes to READY, or
++   * when this is set after that; until then all three are offered, so that
++   * a parser can be linked in NULL.
 +   */
 +  g_object_class_install_property (gobject_class, PROP_PASSTHROUGH,
 +      g_param_spec_boolean ("passthrough", "Passthrough",
 +          "Offer AC-3, E-AC-3 and DTS for IEC 61937 passthrough",
 +          DEFAULT_PASSTHROUGH, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 +
-+  /* GstStreamVolume, as openslessink has. It does not apply to passthrough,
-+   * where mute sends silence instead. */
++  /* GstStreamVolume, as openslessink has. A bitstream can't be scaled, so on
++   * passthrough mute and volume 0 send silence and any other volume has no
++   * effect, as in aaudiosink. */
 +  g_object_class_install_property (gobject_class, PROP_VOLUME,
 +      g_param_spec_double ("volume", "Volume", "Volume of this stream",
 +          0.0, 1.0, DEFAULT_VOLUME,
