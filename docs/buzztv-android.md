@@ -242,6 +242,28 @@ send silence on `mute` or at `volume` 0, and any other volume has no effect.
 | PCM channels | 1-2; 1-8 from API 32 (`AAudioStreamBuilder_setChannelMask`) | 1-8 |
 | PCM rates | 8000-192000, resampled by the framework | same |
 | IEC 61937 | API 34+ (`AAUDIO_FORMAT_IEC61937`), only with `passthrough=true` | API 24+ (`ENCODING_IEC61937`), only with `passthrough=true` |
+| device buffer | `buffer-time` (200 ms by default); the platform may raise it | 100 ms, or `getMinBufferSize()` if larger; `buffer-time` isn't used |
+
+**AudioFlinger's heap.** Up to Android 13, AudioFlinger allocates all of a
+process's tracks from a single 1 MiB heap, and it rounds each track's frame
+count up to a power of two. On the p6 (API 33):
+
+| track | frames asked | frames allocated | bytes |
+| --- | --- | --- | --- |
+| `audiotracksink`, 7.1 float, 48 kHz | 4800 | 8192 | 262,376 |
+| `audiotracksink`, 5.1 float, 48 kHz | 4800 | 8192 | 196,840 |
+| `aaudiosink`, 7.1 float, 48 kHz | 9600 | 16384 | 524,520 |
+
+So the app can hold only three 7.1 `audiotracksink` tracks at once, about five
+at 5.1, and a single 7.1 `aaudiosink` one. The next fails with `not enough
+memory for AudioTrack` and its pipeline errors out, which is what a Multi
+Screen tile with a track of its own ran into. Stereo tracks are small enough
+for nine. A passthrough track counts too: E-AC-3 is 32768 frames of 4 bytes
+through `audiotracksink`. The sinks can't make room for more, so the app has
+to keep few real tracks, for instance by giving only the audible player an
+audio sink. Android 14 allocates from larger pools: the G Series (API 34) held
+five 7.1 `aaudiosink` tracks and a stereo one, about 3.2 MB, without a
+failure.
 
 **Channel layouts**, as GStreamer `channel-mask` → Android mask. These are the
 layouts ExoPlayer's and mpv's AudioTrack outputs open:
